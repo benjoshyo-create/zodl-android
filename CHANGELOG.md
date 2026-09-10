@@ -12,6 +12,14 @@ and this application adheres to [Semantic Versioning](https://semver.org/spec/v2
 - Bitcoin, Litecoin, EIP-681 and Solana payment URIs are parsed through the SDK and routed into asset selection,
   Pay and Swap; unsupported schemes, Solana transaction requests and unknown assets are rejected (MOB-1751).
 
+### Changed:
+
+- Coinholder Polling now votes with at most two note bundles instead of one per five notes, so a
+  wallet with many small notes no longer pays for dozens of proofs and confirmation waits. Bundles
+  are only dropped while the voting weight they carry stays under 1 % of your eligible balance
+  (never more than 1,000 ZEC), and the confirmation screen shows exactly how much weight was left
+  out.
+
 ## [3.13.0 (2705)] - 2026-09-15
 
 ### Added:
