@@ -14,6 +14,22 @@ directly impact users rather than highlighting other key architectural updates.*
 
 ## [Unreleased]
 
+## [3.13.0 (2705)] - 2026-09-15
+
+### Added:
+
+- We added Dash, Bitcoin Cash, ZEC on Solana, and ZEC on NEAR to Swap and CrossPay.
+- We added all CoinMarketCap fiat currencies to Currency Conversion.
+
+### Changed:
+
+- We added a refund warning for Swap and CrossPay transactions under $300.
+- We included Tor connection status in support emails.
+
+### Fixed:
+
+- We fixed backup reminders being hidden by migration or error banners.
+
 ## [3.11.0 (2653)] - 2026-09-08
 
 ### Added:
