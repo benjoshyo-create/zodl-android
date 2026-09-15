@@ -7,6 +7,11 @@ and this application adheres to [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added:
+
+- Bitcoin, Litecoin, EIP-681 and Solana payment URIs are parsed through the SDK and routed into asset selection,
+  Pay and Swap; unsupported schemes, Solana transaction requests and unknown assets are rejected (MOB-1751).
+
 ## [3.13.0 (2705)] - 2026-09-15
 
 ### Added:
