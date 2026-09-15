@@ -7,6 +7,39 @@ and this application adheres to [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [3.13.0 (2705)] - 2026-09-15
+
+### Added:
+
+- The support email now includes whether Tor is enabled.
+- Swap and CrossPay now warn you before requesting a quote when the amount you are sending is worth less than
+  $300, because NEAR does not refund a swap or payment under $300 that is lost to a wrong address or a wrong
+  network. The warning carries a "Don't show this message again" checkbox that silences it for that flow only
+  (MOB-1890).
+
+### Changed:
+
+- The Swap, CrossPay and refund-address explainers no longer describe NEAR refunds as unconditional; they now
+  state the $300 threshold. The Swap and CrossPay explainers also gained a "Learn more" button that opens the
+  matching support article, and all three explainers now close with a "Dismiss" button instead of "OK", matching
+  iOS (MOB-1890).
+- Currency Conversion now offers every fiat currency supported by the exchange-rate provider except CUP, IRR and RUB. The currency picker loads
+  the list on demand and shows a loading state, or an error with retry when the list cannot be fetched.
+- Currency Conversion now reaches the exchange-rate provider over Tor even when Tor is turned off in Settings
+  and Currency Conversion has not been enabled yet, so the currency picker loads its list on first use instead
+  of showing an error.
+
+### Fixed:
+
+- The seed backup prompt now always takes priority over the migration banner and any sync/connectivity error banner once your wallet has received a balance and you haven't backed up your recovery phrase yet, so it can no longer be hidden behind other home screen messages for days.
+- The loading placeholders on the currency and swap-asset picker sheets are visible again; they used the same
+  colour as the sheet background.
+
+### Removed:
+
+- The "Disable Tor?" dialog for a failed Tor start-up. Tor starts lazily, so the condition it reported could
+  never occur.
+
 ## [3.11.0 (2653)] - 2026-09-08
 
 ### Added:

@@ -136,6 +136,41 @@ class AutomaticServerRepositoryTest {
         }
 
     @Test
+    fun automaticIsNeverCustom() =
+        runTest {
+            coEvery { isAutomaticProvider.get() } returns true
+            assertEquals(false, repository.isServerCustom())
+        }
+
+    @Test
+    fun manualWithBundledEndpointIsNotCustom() =
+        runTest {
+            coEvery { isAutomaticProvider.get() } returns false
+            coEvery { persistableWalletProvider.getPersistableWallet() } returns wallet(known.last())
+
+            assertEquals(false, repository.isServerCustom())
+        }
+
+    @Test
+    fun manualWithNonBundledEndpointIsCustom() =
+        runTest {
+            coEvery { isAutomaticProvider.get() } returns false
+            coEvery { persistableWalletProvider.getPersistableWallet() } returns
+                wallet(endpoint("custom.example.com"))
+
+            assertEquals(true, repository.isServerCustom())
+        }
+
+    @Test
+    fun manualWithoutWalletIsNotCustom() =
+        runTest {
+            coEvery { isAutomaticProvider.get() } returns false
+            coEvery { persistableWalletProvider.getPersistableWallet() } returns null
+
+            assertEquals(false, repository.isServerCustom())
+        }
+
+    @Test
     fun manualSelectionSkipsTheSdkBenchmark() =
         runTest {
             coEvery { isAutomaticProvider.get() } returns false

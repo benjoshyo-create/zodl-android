@@ -4,6 +4,7 @@ import android.os.SystemClock
 import cash.z.ecc.android.sdk.Synchronizer
 import co.electriccoin.lightwallet.client.model.LightWalletEndpoint
 import co.electriccoin.zcash.spackle.Twig
+import co.electriccoin.zcash.ui.common.datasource.resolveIsEndpointCustom
 import co.electriccoin.zcash.ui.common.datasource.resolveIsServerSelectionAutomatic
 import co.electriccoin.zcash.ui.common.provider.ApplicationStateProvider
 import co.electriccoin.zcash.ui.common.provider.IsServerSelectionAutomaticProvider
@@ -42,6 +43,8 @@ interface AutomaticServerRepository {
     val isServerAutomatic: Flow<Boolean>
 
     suspend fun isServerAutomatic(): Boolean
+
+    suspend fun isServerCustom(): Boolean
 
     fun init()
 }
@@ -104,6 +107,14 @@ class AutomaticServerRepositoryImpl(
             currentEndpoint = currentEndpoint,
             knownEndpoints = lightWalletEndpointProvider.getEndpoints()
         )
+    }
+
+    // Manual mode alone doesn't mean the endpoint is custom, since manual mode also covers pinning
+    // one of our own bundled servers — see resolveIsEndpointCustom.
+    override suspend fun isServerCustom(): Boolean {
+        if (isServerAutomatic()) return false
+        val endpoint = persistableWalletProvider.getPersistableWallet()?.endpoint
+        return endpoint != null && resolveIsEndpointCustom(endpoint, lightWalletEndpointProvider.getEndpoints())
     }
 
     override fun init() {
