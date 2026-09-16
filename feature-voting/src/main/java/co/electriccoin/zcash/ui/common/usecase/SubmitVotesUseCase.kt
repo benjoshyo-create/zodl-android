@@ -16,6 +16,7 @@ import co.electriccoin.zcash.ui.common.model.voting.TxResult
 import co.electriccoin.zcash.ui.common.model.voting.VoteCommitmentBundle
 import co.electriccoin.zcash.ui.common.model.voting.VotingErrors
 import co.electriccoin.zcash.ui.common.model.voting.VotingPirLayout
+import co.electriccoin.zcash.ui.common.model.voting.VotingProvingLimits
 import co.electriccoin.zcash.ui.common.model.voting.VotingRoundPreparationResult
 import co.electriccoin.zcash.ui.common.model.voting.VotingSession
 import co.electriccoin.zcash.ui.common.model.voting.VotingSubmissionProgress
@@ -513,7 +514,7 @@ class SubmitVotesUseCase(
                 authorizing = true,
                 onProgress = onProgress
             )
-        val proofPermits = Semaphore(MAX_CONCURRENT_PROOFS)
+        val proofPermits = Semaphore(VotingProvingLimits.MAX_CONCURRENT_PROOFS)
         val postMutex = Mutex()
         coroutineScope {
             (0 until bundleCount)
@@ -1230,12 +1231,12 @@ class SubmitVotesUseCase(
 
     /**
      * Runs one independent chain per bundle. Chains never share a step: proving is bounded at
-     * [MAX_CONCURRENT_PROOFS] — the same cap as the trimmed bundle count, so every bundle can prove
-     * at once now that the SDK proves each one on its own database connection outside its shared
-     * lock — and only posting is serialized (one broadcast at a time keeps the vote chain's view of
-     * the mempool ordered, and the vote server has no idempotency key to reconcile a reordered
-     * pair). Everything else — witnesses, the confirmation wait, share delivery — overlaps, which
-     * is where the wall-clock saving comes from.
+     * [VotingProvingLimits.MAX_CONCURRENT_PROOFS] — the same cap as the trimmed bundle count, so
+     * every bundle can prove at once now that the SDK proves each one on its own database
+     * connection outside its shared lock — and only posting is serialized (one broadcast at a time
+     * keeps the vote chain's view of the mempool ordered, and the vote server has no idempotency
+     * key to reconcile a reordered pair). Everything else — witnesses, the confirmation wait,
+     * share delivery — overlaps, which is where the wall-clock saving comes from.
      *
      * A question this bundle already has on chain skips the vote itself but still enters share
      * delivery: a run that failed while delivering shares left every vote submitted, so the retry
@@ -1250,7 +1251,7 @@ class SubmitVotesUseCase(
         shareDelivery: ShareDelivery,
         questionBarrier: QuestionBarrier
     ) {
-        val proofPermits = Semaphore(MAX_CONCURRENT_PROOFS)
+        val proofPermits = Semaphore(VotingProvingLimits.MAX_CONCURRENT_PROOFS)
         val postMutex = Mutex()
         val coalescer = VoteTreeSyncCoalescer { syncVoteTreeOrThrow(context, dbHandle) }
         val chainTickets = LongArray(bundleCount.coerceAtLeast(1))
@@ -1574,8 +1575,8 @@ class SubmitVotesUseCase(
 
     /**
      * Broadcasts an already-proved commitment and persists its transaction hash. Kept separate from
-     * [proveVoteBundle] so a run can bound proving at [MAX_CONCURRENT_PROOFS] while still
-     * serializing posting (one broadcast at a time), independently of each other.
+     * [proveVoteBundle] so a run can bound proving at [VotingProvingLimits.MAX_CONCURRENT_PROOFS]
+     * while still serializing posting (one broadcast at a time), independently of each other.
      */
     private suspend fun postVoteBundle(
         context: VotingSubmitContext,
@@ -2316,13 +2317,6 @@ class SubmitVotesUseCase(
 
     private companion object {
         const val TAG = "SubmitVotesUseCase"
-
-        /**
-         * Delegation and vote proofs in flight at once, matching the trimmed bundle cap so every
-         * bundle proves in parallel. The SDK gives each bundle its own database connection and
-         * proves outside the session mutex, so a second proof no longer queues behind the first.
-         */
-        const val MAX_CONCURRENT_PROOFS = 2
 
         /**
          * Background share deliveries in flight at once, the window iOS admits as well. Each one

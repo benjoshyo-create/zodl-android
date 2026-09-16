@@ -3,6 +3,7 @@ package co.electriccoin.zcash.ui.common.repository
 import co.electriccoin.zcash.ui.common.model.voting.DelegationPhase
 import co.electriccoin.zcash.ui.common.model.voting.VotingDelegationPirPrecomputeResult
 import co.electriccoin.zcash.ui.common.model.voting.VotingPirLayout
+import co.electriccoin.zcash.ui.common.model.voting.VotingProvingLimits
 import co.electriccoin.zcash.ui.common.provider.PirSnapshotResolver
 import co.electriccoin.zcash.ui.common.provider.VotingCryptoClient
 import kotlinx.coroutines.CancellationException
@@ -144,12 +145,14 @@ class VotingProofPrecomputeRepositoryImpl(
     private val liveProofMaterials = mutableSetOf<VotingDelegationProofMaterial>()
 
     /**
-     * One background proof at a time, so a foreground submission still gets most of the cores.
+     * Two background proofs at once - the round's whole trimmed bundle count - so a round is warm
+     * by the time the user reaches the confirmation screen.
+     *
      * `SubmitVotesUseCase` awaits the background proof of a bundle before proving that bundle
-     * itself, so a background ZKP1 and a foreground proof of the same bundle never overlap;
-     * proofs of different bundles may.
+     * itself, so a background ZKP1 and a foreground proof of the same bundle never overlap; a
+     * foreground proof of another bundle shares the cores with at most these two.
      */
-    private val proofPermits = Semaphore(1)
+    private val proofPermits = Semaphore(VotingProvingLimits.MAX_CONCURRENT_PROOFS)
 
     override fun warmProvingCaches() {
         if (!warmupStarted.compareAndSet(false, true)) {

@@ -259,10 +259,18 @@ class VotingProofPrecomputeRepositoryTest {
             scope.cancel()
         }
 
+    /**
+     * Each proof blocks inside the fake until its sibling has entered it, so a run that still
+     * proved one bundle at a time would time out there instead of reaching the assertion.
+     */
     @Test
-    fun proofStagesRunOneAtATime() =
+    fun proofStagesRunTwoAtATime() =
         runBlocking {
-            val cryptoClient = FakeVotingCryptoClient(proofDelayMillis = PROOF_DELAY_MILLIS)
+            val cryptoClient =
+                FakeVotingCryptoClient(
+                    provedBundleIndices = listOf(PROOF_BUNDLE_INDEX, PROOF_BUNDLE_INDEX + 1),
+                    concurrentProofTarget = 2
+                )
             val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
             val repository = repository(cryptoClient, scope)
             val first = precomputeRequest(proofMaterial = proofMaterial(), bundleIndex = PROOF_BUNDLE_INDEX)
@@ -271,10 +279,9 @@ class VotingProofPrecomputeRepositoryTest {
             repository.startDelegationPirPrecompute(first)
             repository.startDelegationPirPrecompute(second)
             requireNotNull(repository.awaitDelegationProof(first.key)).getOrThrow()
-            // The second bundle is not PCZT_BUILT in this fake, so only its permit matters here.
-            requireNotNull(repository.awaitDelegationProof(second.key))
+            requireNotNull(repository.awaitDelegationProof(second.key)).getOrThrow()
 
-            assertEquals(1, cryptoClient.maxConcurrentProofs)
+            assertEquals(2, cryptoClient.maxConcurrentProofs)
 
             scope.cancel()
         }
@@ -418,13 +425,18 @@ private class FakeVotingCryptoClient(
     private val precomputeFailure: Exception? = null,
     private val proofFailure: Exception? = null,
     private val bundlePhase: DelegationPhase? = DelegationPhase.PCZT_BUILT,
+    private val provedBundleIndices: List<Int> = listOf(PROOF_BUNDLE_INDEX),
     private val proofDelayMillis: Long = 0,
-    private val proofGate: ProofGate? = null
+    private val proofGate: ProofGate? = null,
+    concurrentProofTarget: Int? = null
 ) {
     val calls = mutableListOf<CryptoCall>()
     var warmupCount = 0
     var maxConcurrentProofs = 0
     private var activeProofs = 0
+
+    /** Holds every proof until [concurrentProofTarget] of them are inside the fake at once. */
+    private val concurrentProofs = concurrentProofTarget?.let { target -> CountDownLatch(target) }
 
     val client: VotingCryptoClient =
         Proxy.newProxyInstance(
@@ -463,8 +475,9 @@ private class FakeVotingCryptoClient(
 
                 "delegationPhases" -> {
                     calls += CryptoCall.DelegationPhases(args.valueAt(0), args.valueAt(1))
-                    bundlePhase?.let { phase -> listOf(BundleDelegationPhase(PROOF_BUNDLE_INDEX, phase)) }
-                        ?: emptyList<BundleDelegationPhase>()
+                    bundlePhase?.let { phase ->
+                        provedBundleIndices.map { index -> BundleDelegationPhase(index, phase) }
+                    } ?: emptyList<BundleDelegationPhase>()
                 }
 
                 "buildAndProveDelegation" -> {
@@ -476,6 +489,10 @@ private class FakeVotingCryptoClient(
                     @Suppress("ForbiddenComment")
                     if (proofDelayMillis > 0) {
                         Thread.sleep(proofDelayMillis)
+                    }
+                    concurrentProofs?.let { latch ->
+                        latch.countDown()
+                        latch.await(GATE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
                     }
                     proofGate?.let { gate ->
                         gate.entered.countDown()
