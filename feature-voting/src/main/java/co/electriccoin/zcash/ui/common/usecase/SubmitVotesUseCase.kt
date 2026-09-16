@@ -163,14 +163,14 @@ class SubmitVotesUseCase(
             val accountUuidString = selectedAccount.sdkAccount.accountUuid.toVotingAccountScopeId()
             val accountUuidCanonical = selectedAccount.sdkAccount.accountUuid.toCanonicalUuidString()
 
-            prepareVotingRoundIfNeeded(roundId, accountUuidString)
-
             val sessionContext = resolveVotingRoundSession(roundId)
             val session = sessionContext.session
             val sessionRoundId = session.voteRoundId.toHex()
             require(sessionRoundId.equals(roundId, ignoreCase = true)) {
                 "Round $roundId does not match active session $sessionRoundId"
             }
+
+            prepareVotingRoundIfNeeded(roundId, accountUuidString, session)
 
             val serviceConfig = sessionContext.serviceConfig
             val voteServerUrls =
@@ -414,15 +414,21 @@ class SubmitVotesUseCase(
     /**
      * Runs round preparation unless this round already has a prepared bundle setup. That setup can
      * only exist because the confirm screen's view model already ran preparation for this round,
-     * which means its eligibility and scanned-height gates both passed; neither can regress between
-     * that screen and the tap that starts the submission, so re-running them only repeats a wallet
-     * read and a full round resolve on the critical path.
+     * which means its eligibility and scanned-height gates both passed, so re-running the whole of
+     * it only repeats a wallet read and a full round resolve on the critical path.
+     *
+     * Eligibility is settled once the bundles are prepared, but the scanned height is not: the
+     * wallet can fall behind this round's snapshot between the confirm screen and the tap that
+     * starts the submission, so the skip path still runs that one gate and fails exactly as the
+     * full preparation would.
      */
     private suspend fun prepareVotingRoundIfNeeded(
         roundId: String,
-        accountUuidString: String
+        accountUuidString: String,
+        session: VotingSession
     ) {
         if (votingRecoveryRepository.get(accountUuidString, roundId)?.preparedBundleSetup() != null) {
+            requireWalletSynced(session)
             return
         }
         val preparation =
@@ -450,6 +456,17 @@ class SubmitVotesUseCase(
                 )
             }
         }
+    }
+
+    /** Fails the submission exactly as full round preparation would when the wallet is behind. */
+    private suspend fun requireWalletSynced(session: VotingSession) {
+        val walletSyncing = prepareVotingRound.awaitWalletSynced(session) ?: return
+        throw VotingSubmissionRecoverableException(
+            VotingErrors.WalletSyncing(
+                scannedHeight = walletSyncing.scannedHeight,
+                snapshotHeight = walletSyncing.snapshotHeight
+            )
+        )
     }
 
     private fun VotingRecoverySnapshot.needsDelegationSubmission(): Boolean =

@@ -14,6 +14,7 @@ import co.electriccoin.zcash.ui.common.model.voting.VotingBundleTrim
 import co.electriccoin.zcash.ui.common.model.voting.VotingErrors
 import co.electriccoin.zcash.ui.common.model.voting.VotingPirLayout
 import co.electriccoin.zcash.ui.common.model.voting.VotingRoundPreparationResult
+import co.electriccoin.zcash.ui.common.model.voting.VotingSession
 import co.electriccoin.zcash.ui.common.model.voting.VotingSubmissionRecoverableException
 import co.electriccoin.zcash.ui.common.model.voting.computeTrimmedBundleKeepCount
 import co.electriccoin.zcash.ui.common.model.voting.isDelegationSetupOverwrite
@@ -68,19 +69,7 @@ class PrepareVotingRoundUseCase(
             }
 
             val synchronizer = synchronizerProvider.getSynchronizer()
-            val scannedHeight = awaitFullyScannedHeight(synchronizer)
-            if (scannedHeight == null || scannedHeight < session.snapshotHeight) {
-                Log.i(
-                    TAG,
-                    "WalletSyncing gate tripped for round $roundId: scannedHeight=$scannedHeight " +
-                        "snapshotHeight=${session.snapshotHeight} network=${synchronizer.network.networkName}"
-                )
-                votingSessionStore.setEligibility(VotingEligibility.WALLET_SYNCING)
-                return@withContext VotingRoundPreparationResult.WalletSyncing(
-                    scannedHeight = scannedHeight,
-                    snapshotHeight = session.snapshotHeight
-                )
-            }
+            awaitWalletSynced(session)?.let { walletSyncing -> return@withContext walletSyncing }
 
             val selectedAccount = getSelectedWalletAccount()
             val accountUuid = selectedAccount.sdkAccount.accountUuid
@@ -640,6 +629,35 @@ class PrepareVotingRoundUseCase(
             }
         }
         return requests
+    }
+
+    /**
+     * The wallet-synced gate, null once the wallet has scanned past this round's snapshot height.
+     * A non-null result has already recorded [VotingEligibility.WALLET_SYNCING], so the caller only
+     * has to surface it.
+     *
+     * Kept callable on its own because a submission that skips preparation - the confirm screen
+     * already prepared this round - must still run it: the wallet can fall behind the snapshot
+     * between that screen and the tap that starts the submission, and voting against an unscanned
+     * wallet builds the round's bundles from notes that are not all there.
+     */
+    internal suspend fun awaitWalletSynced(session: VotingSession): VotingRoundPreparationResult.WalletSyncing? {
+        val synchronizer = synchronizerProvider.getSynchronizer()
+        val scannedHeight = awaitFullyScannedHeight(synchronizer)
+        if (scannedHeight != null && scannedHeight >= session.snapshotHeight) {
+            return null
+        }
+        Log.i(
+            TAG,
+            "WalletSyncing gate tripped for round ${session.voteRoundId.toHex()}: " +
+                "scannedHeight=$scannedHeight snapshotHeight=${session.snapshotHeight} " +
+                "network=${synchronizer.network.networkName}"
+        )
+        votingSessionStore.setEligibility(VotingEligibility.WALLET_SYNCING)
+        return VotingRoundPreparationResult.WalletSyncing(
+            scannedHeight = scannedHeight,
+            snapshotHeight = session.snapshotHeight
+        )
     }
 
     private suspend fun awaitFullyScannedHeight(synchronizer: Synchronizer): Long? {

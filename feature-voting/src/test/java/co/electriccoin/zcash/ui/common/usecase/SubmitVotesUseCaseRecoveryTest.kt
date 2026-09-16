@@ -1032,6 +1032,7 @@ class SubmitVotesUseCaseRecoveryTest {
                     eligibleWeight = bundleCount.toLong(),
                     hotkeyAddress = "hotkey"
                 )
+            coEvery { prepareVotingRound.awaitWalletSynced(any()) } returns null
             coEvery { resolveVotingRoundSession(ROUND_ID) } returns
                 VotingRoundSessionContext(
                     session = session,
@@ -1370,6 +1371,7 @@ class SubmitVotesUseCaseRecoveryTest {
             coEvery { getSelectedWalletAccount() } returns selectedAccount
             coEvery { prepareVotingRound(ROUND_ID) } returns
                 VotingRoundPreparationResult.Ready(ROUND_ID, 2, 2, "hotkey")
+            coEvery { prepareVotingRound.awaitWalletSynced(any()) } returns null
             coEvery { resolveVotingRoundSession(ROUND_ID) } returns
                 VotingRoundSessionContext(
                     session = session,

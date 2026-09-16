@@ -14,10 +14,12 @@ import co.electriccoin.zcash.ui.common.model.voting.DelegationPhase
 import co.electriccoin.zcash.ui.common.model.voting.Proposal
 import co.electriccoin.zcash.ui.common.model.voting.SessionStatus
 import co.electriccoin.zcash.ui.common.model.voting.VoteOption
+import co.electriccoin.zcash.ui.common.model.voting.VotingErrors
 import co.electriccoin.zcash.ui.common.model.voting.VotingPirLayout
 import co.electriccoin.zcash.ui.common.model.voting.VotingRoundPreparationResult
 import co.electriccoin.zcash.ui.common.model.voting.VotingServiceConfig
 import co.electriccoin.zcash.ui.common.model.voting.VotingSession
+import co.electriccoin.zcash.ui.common.model.voting.VotingSubmissionRecoverableException
 import co.electriccoin.zcash.ui.common.model.voting.VotingTxHashLookup
 import co.electriccoin.zcash.ui.common.provider.PirSnapshotResolver
 import co.electriccoin.zcash.ui.common.provider.SynchronizerProvider
@@ -45,6 +47,7 @@ import java.util.Base64
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
 
 class SubmitVotesUseCaseBackgroundProofTest {
     @Test
@@ -135,6 +138,33 @@ class SubmitVotesUseCaseBackgroundProofTest {
             coVerify(exactly = 0) { fixture.prepareVotingRound(ROUND_ID) }
         }
 
+    /**
+     * The wallet fell behind the snapshot after the confirm screen prepared the round, so the
+     * submission fails the same way full preparation would have.
+     */
+    @Test
+    fun keepsTheWalletSyncedGateWhenRoundPreparationIsSkipped() =
+        runTest {
+            val fixture =
+                BackgroundProofFixture(
+                    walletSyncing =
+                        VotingRoundPreparationResult.WalletSyncing(
+                            scannedHeight = SCANNED_HEIGHT,
+                            snapshotHeight = SNAPSHOT_HEIGHT
+                        )
+                )
+
+            val failure =
+                assertFailsWith<VotingSubmissionRecoverableException> {
+                    fixture.newUseCase()(ROUND_ID, mapOf(1 to 0))
+                }
+
+            val walletSyncing = assertIs<VotingErrors.WalletSyncing>(failure.failure)
+            assertEquals(SCANNED_HEIGHT, walletSyncing.scannedHeight)
+            assertEquals(SNAPSHOT_HEIGHT, walletSyncing.snapshotHeight)
+            coVerify(exactly = 0) { fixture.prepareVotingRound(ROUND_ID) }
+        }
+
     @Test
     fun reusesThePirEndpointThePrecomputeAlreadyResolved() =
         runTest {
@@ -181,7 +211,8 @@ class SubmitVotesUseCaseBackgroundProofTest {
         rebuiltSinceProofBundles: Set<Int> = emptySet(),
         initialDelegationPhase: DelegationPhase = DelegationPhase.PCZT_BUILT,
         private val preparedPirServerUrl: String? = null,
-        witnessesAlreadyComplete: Boolean = false
+        witnessesAlreadyComplete: Boolean = false,
+        private val walletSyncing: VotingRoundPreparationResult.WalletSyncing? = null
     ) {
         val crypto = mockk<VotingCryptoClient>(relaxed = true)
         val delegationPhases = mutableListOf(initialDelegationPhase)
@@ -263,6 +294,7 @@ class SubmitVotesUseCaseBackgroundProofTest {
             coEvery { getSelectedWalletAccount() } returns selectedAccount
             coEvery { prepareVotingRound(ROUND_ID) } returns
                 VotingRoundPreparationResult.Ready(ROUND_ID, 1, 1, "hotkey")
+            coEvery { prepareVotingRound.awaitWalletSynced(any()) } returns walletSyncing
             coEvery { resolveVotingRoundSession(ROUND_ID) } returns
                 VotingRoundSessionContext(
                     session = votingSession(),
@@ -362,6 +394,8 @@ class SubmitVotesUseCaseBackgroundProofTest {
 
     private companion object {
         const val ROUND_ID = "1111111111111111111111111111111111111111111111111111111111111111"
+        const val SCANNED_HEIGHT = 100L
+        const val SNAPSHOT_HEIGHT = 200L
 
         fun encode(value: ByteArray): String = Base64.getEncoder().encodeToString(value)
 
