@@ -225,13 +225,23 @@ class VotingProofPrecomputeRepositoryImpl(
      * The PIR data the proof reads is exactly what [runPrecompute] warms, so the proof waits for it
      * rather than duplicating the fetch. A failed or absent precompute fails the proof stage; the
      * caller then proves on demand as before.
+     *
+     * The stage holds one DB handle from before the precompute wait until after the proof, rather
+     * than opening one per step: every job's handle then overlaps the others', so the Rust handle
+     * and the PIR client it caches live from the round's first precompute to its last proof. The
+     * handle is opened after the first cancellation check and closed in the finally, so a job
+     * cancelled before it starts opens nothing and one cancelled later still releases it.
      */
     private suspend fun runProofStage(
         request: VotingDelegationPirPrecomputeRequest,
         material: VotingDelegationProofMaterial
     ): Result<Unit> =
         runCatching {
+            coroutineContext.ensureActive()
+            val dbHandle = votingCryptoClient.openVotingDb(request.votingDbPath)
+            check(dbHandle != 0L) { "Failed to open voting DB at ${request.votingDbPath}" }
             try {
+                votingCryptoClient.setWalletId(dbHandle, request.walletId, request.networkId)
                 val pirOutcome =
                     requireNotNull(awaitDelegationPirPrecompute(request.key)) {
                         "Voting PIR precompute was never scheduled for round ${request.roundId} " +
@@ -243,18 +253,19 @@ class VotingProofPrecomputeRepositoryImpl(
                         "Voting PIR server URL is missing for round ${request.roundId} " +
                             "bundle ${request.bundleIndex}"
                     }
-                proofPermits.withPermit { runProof(request, material, pirServerUrl) }
+                proofPermits.withPermit { runProof(request, material, pirServerUrl, dbHandle) }
             } finally {
+                votingCryptoClient.closeVotingDb(dbHandle)
                 synchronized(lock) { liveProofMaterials -= material }
                 material.clear()
             }
         }
 
     /**
-     * Produces the delegation proof on its own DB handle.
+     * Produces the delegation proof on the stage's [dbHandle].
      *
-     * Waiting for the permit can take a long time, so the round is re-checked before a handle is
-     * opened for a proof whose round may since have been torn down. Only a bundle that is
+     * Waiting for the permit can take a long time, so the round is re-checked before proving one
+     * whose round may since have been torn down. Only a bundle that is
      * [DelegationPhase.PCZT_BUILT] has the alpha this proof binds to; anything else is either not
      * ready yet or already past the proof, and proving it would be wasted work.
      *
@@ -266,47 +277,40 @@ class VotingProofPrecomputeRepositoryImpl(
     private suspend fun runProof(
         request: VotingDelegationPirPrecomputeRequest,
         material: VotingDelegationProofMaterial,
-        pirServerUrl: String
+        pirServerUrl: String,
+        dbHandle: Long
     ) {
         coroutineContext.ensureActive()
-        val dbHandle = votingCryptoClient.openVotingDb(request.votingDbPath)
-        check(dbHandle != 0L) { "Failed to open voting DB at ${request.votingDbPath}" }
-
+        val phase =
+            votingCryptoClient
+                .delegationPhases(dbHandle, request.roundId)
+                .firstOrNull { bundle -> bundle.bundleIndex == request.bundleIndex }
+                ?.phase
+        check(phase == DelegationPhase.PCZT_BUILT) {
+            "Voting bundle ${request.bundleIndex} of round ${request.roundId} is $phase, " +
+                "not ${DelegationPhase.PCZT_BUILT}"
+        }
+        val fvkBytes = material.fvkBytes.copyOf()
+        val hotkeySeed = material.hotkeySeed.copyOf()
+        val seedFingerprint = material.seedFingerprint.copyOf()
         try {
-            votingCryptoClient.setWalletId(dbHandle, request.walletId, request.networkId)
-            val phase =
-                votingCryptoClient
-                    .delegationPhases(dbHandle, request.roundId)
-                    .firstOrNull { bundle -> bundle.bundleIndex == request.bundleIndex }
-                    ?.phase
-            check(phase == DelegationPhase.PCZT_BUILT) {
-                "Voting bundle ${request.bundleIndex} of round ${request.roundId} is $phase, " +
-                    "not ${DelegationPhase.PCZT_BUILT}"
-            }
-            val fvkBytes = material.fvkBytes.copyOf()
-            val hotkeySeed = material.hotkeySeed.copyOf()
-            val seedFingerprint = material.seedFingerprint.copyOf()
-            try {
-                votingCryptoClient.buildAndProveDelegation(
-                    dbHandle = dbHandle,
-                    roundId = request.roundId,
-                    bundleIndex = request.bundleIndex,
-                    pirServerUrl = pirServerUrl,
-                    pirLayout = request.pirLayout,
-                    notesJson = request.notesJson,
-                    fvkBytes = fvkBytes,
-                    hotkeySeed = hotkeySeed,
-                    seedFingerprint = seedFingerprint,
-                    accountIndex = material.accountIndex,
-                    roundName = material.roundName
-                )
-            } finally {
-                fvkBytes.fill(0)
-                hotkeySeed.fill(0)
-                seedFingerprint.fill(0)
-            }
+            votingCryptoClient.buildAndProveDelegation(
+                dbHandle = dbHandle,
+                roundId = request.roundId,
+                bundleIndex = request.bundleIndex,
+                pirServerUrl = pirServerUrl,
+                pirLayout = request.pirLayout,
+                notesJson = request.notesJson,
+                fvkBytes = fvkBytes,
+                hotkeySeed = hotkeySeed,
+                seedFingerprint = seedFingerprint,
+                accountIndex = material.accountIndex,
+                roundName = material.roundName
+            )
         } finally {
-            votingCryptoClient.closeVotingDb(dbHandle)
+            fvkBytes.fill(0)
+            hotkeySeed.fill(0)
+            seedFingerprint.fill(0)
         }
     }
 

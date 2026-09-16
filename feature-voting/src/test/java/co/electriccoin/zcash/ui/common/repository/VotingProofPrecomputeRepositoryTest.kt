@@ -156,6 +156,10 @@ class VotingProofPrecomputeRepositoryTest {
             scope.cancel()
         }
 
+    /**
+     * The proof stage opens its own handle before it waits for the PIR stage and holds it until
+     * the proof is done, so the two handles overlap rather than following each other.
+     */
     @Test
     fun proofStageRunsAfterPirOnOwnHandle() =
         runBlocking {
@@ -169,20 +173,24 @@ class VotingProofPrecomputeRepositoryTest {
 
             requireNotNull(repository.awaitDelegationProof(request.key)).getOrThrow()
 
-            // The proof opens and closes its own handle after the PIR stage has closed its one.
             assertEquals(
                 listOf(
                     "openVotingDb",
                     "setWalletId",
-                    "precomputeDelegationPir",
-                    "closeVotingDb",
                     "openVotingDb",
                     "setWalletId",
+                    "precomputeDelegationPir",
+                    "closeVotingDb",
                     "delegationPhases",
                     "buildAndProveDelegation",
                     "closeVotingDb"
                 ),
                 cryptoClient.calls.map { call -> call.label() }
+            )
+            assertTrue(
+                cryptoClient.calls.indexOfFirst { call -> call is CryptoCall.SetWalletId } <
+                    cryptoClient.calls.indexOfFirst { call -> call is CryptoCall.CloseVotingDb },
+                "the proof stage's handle must be live before the PIR stage closes its own"
             )
             // The key material is zeroed as soon as the proof no longer needs it.
             assertContentEquals(ByteArray(3), material.fvkBytes)
@@ -408,6 +416,10 @@ private class FakePirSnapshotResolver(
 ) : PirSnapshotResolver {
     val calls = mutableListOf<ResolveCall>()
 
+    /**
+     * Resolving an endpoint is network work, and suspending here lets a sibling proof stage run -
+     * which is what makes the interleaving of the two stages deterministic in these tests.
+     */
     override suspend fun resolve(
         endpoints: List<String>,
         expectedSnapshotHeight: Long
@@ -417,6 +429,7 @@ private class FakePirSnapshotResolver(
                 endpoints = endpoints,
                 expectedSnapshotHeight = expectedSnapshotHeight
             )
+        yield()
         return resolvedUrl
     }
 }

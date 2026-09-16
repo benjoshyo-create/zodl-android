@@ -39,6 +39,7 @@ import co.electriccoin.zcash.ui.common.model.voting.VotingVoteRecord
 import co.electriccoin.zcash.ui.common.model.voting.requireKnownPolyLen
 import co.electriccoin.zcash.ui.common.model.voting.toVoteCommitmentBundle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -583,8 +584,9 @@ class VotingCryptoClientImpl : VotingCryptoClient {
         return handle
     }
 
+    /** Non-cancellable: a cancelled background job must still release its native session. */
     override suspend fun closeVotingDb(dbHandle: Long) {
-        withContext(Dispatchers.IO) {
+        withContext(NonCancellable + Dispatchers.IO) {
             sessions.remove(dbHandle)?.close()
             dbPaths.remove(dbHandle)
         }
