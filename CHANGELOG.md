@@ -37,6 +37,8 @@ and this application adheres to [Semantic Versioning](https://semver.org/spec/v2
 - Coinholder Polling now asks the other vote servers about a pending transaction on every eighth
   confirmation poll, so a vote no longer waits out its whole confirmation budget when the server
   that accepted it stops indexing.
+- The sub-$300 refund warning and the Swap explainer now name a wrong asset, rather than a wrong address, as
+  the mistake NEAR does not refund, matching the updated design (MOB-1890).
 
 ### Fixed:
 
