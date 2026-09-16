@@ -254,6 +254,11 @@ class VotingProofPrecomputeRepositoryImpl(
      * opened for a proof whose round may since have been torn down. Only a bundle that is
      * [DelegationPhase.PCZT_BUILT] has the alpha this proof binds to; anything else is either not
      * ready yet or already past the proof, and proving it would be wasted work.
+     *
+     * The proof reads copies of the key material rather than [material]'s own arrays:
+     * [cancelBackgroundProofs] zeroes those immediately, and a native proof already under way
+     * cannot be interrupted, so it would otherwise read zeroed secrets mid-flight. The copies are
+     * zeroed as soon as the proof returns.
      */
     private suspend fun runProof(
         request: VotingDelegationPirPrecomputeRequest,
@@ -275,19 +280,28 @@ class VotingProofPrecomputeRepositoryImpl(
                 "Voting bundle ${request.bundleIndex} of round ${request.roundId} is $phase, " +
                     "not ${DelegationPhase.PCZT_BUILT}"
             }
-            votingCryptoClient.buildAndProveDelegation(
-                dbHandle = dbHandle,
-                roundId = request.roundId,
-                bundleIndex = request.bundleIndex,
-                pirServerUrl = pirServerUrl,
-                pirLayout = request.pirLayout,
-                notesJson = request.notesJson,
-                fvkBytes = material.fvkBytes,
-                hotkeySeed = material.hotkeySeed,
-                seedFingerprint = material.seedFingerprint,
-                accountIndex = material.accountIndex,
-                roundName = material.roundName
-            )
+            val fvkBytes = material.fvkBytes.copyOf()
+            val hotkeySeed = material.hotkeySeed.copyOf()
+            val seedFingerprint = material.seedFingerprint.copyOf()
+            try {
+                votingCryptoClient.buildAndProveDelegation(
+                    dbHandle = dbHandle,
+                    roundId = request.roundId,
+                    bundleIndex = request.bundleIndex,
+                    pirServerUrl = pirServerUrl,
+                    pirLayout = request.pirLayout,
+                    notesJson = request.notesJson,
+                    fvkBytes = fvkBytes,
+                    hotkeySeed = hotkeySeed,
+                    seedFingerprint = seedFingerprint,
+                    accountIndex = material.accountIndex,
+                    roundName = material.roundName
+                )
+            } finally {
+                fvkBytes.fill(0)
+                hotkeySeed.fill(0)
+                seedFingerprint.fill(0)
+            }
         } finally {
             votingCryptoClient.closeVotingDb(dbHandle)
         }

@@ -15,6 +15,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.yield
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -298,6 +300,35 @@ class VotingProofPrecomputeRepositoryTest {
             scope.cancel()
         }
 
+    /**
+     * The cancel zeroes the material the repository holds, but a native proof already under way
+     * cannot be interrupted - it keeps reading its own copy to the end.
+     */
+    @Test
+    fun cancelLeavesAnInFlightProofsKeyMaterialIntact() =
+        runBlocking {
+            val proofGate = ProofGate()
+            val cryptoClient = FakeVotingCryptoClient(proofGate = proofGate)
+            val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+            val repository = repository(cryptoClient, scope)
+            val material = proofMaterial()
+            val request = precomputeRequest(proofMaterial = material)
+
+            repository.startDelegationPirPrecompute(request)
+            assertTrue(proofGate.entered.await(GATE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS))
+
+            repository.cancelBackgroundProofs()
+            proofGate.release.countDown()
+            assertTrue(proofGate.captured.await(GATE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS))
+
+            assertContentEquals(ByteArray(3), material.fvkBytes)
+            assertContentEquals(byteArrayOf(1, 2, 3), proofGate.fvkBytes)
+            assertContentEquals(byteArrayOf(4, 5, 6), proofGate.hotkeySeed)
+            assertContentEquals(byteArrayOf(7, 8, 9), proofGate.seedFingerprint)
+
+            scope.cancel()
+        }
+
     private fun repository(
         cryptoClient: FakeVotingCryptoClient,
         scope: CoroutineScope
@@ -338,6 +369,21 @@ private const val PROOF_BUNDLE_INDEX = 1
 
 private const val PROOF_DELAY_MILLIS = 100L
 
+private const val GATE_TIMEOUT_MILLIS = 10_000L
+
+/**
+ * Holds a proof inside the fake until the test releases it, then records the key material the
+ * proof was actually given.
+ */
+private class ProofGate {
+    val entered = CountDownLatch(1)
+    val release = CountDownLatch(1)
+    val captured = CountDownLatch(1)
+    var fvkBytes: ByteArray? = null
+    var hotkeySeed: ByteArray? = null
+    var seedFingerprint: ByteArray? = null
+}
+
 private fun CryptoCall.label(): String =
     when (this) {
         is CryptoCall.OpenVotingDb -> "openVotingDb"
@@ -372,7 +418,8 @@ private class FakeVotingCryptoClient(
     private val precomputeFailure: Exception? = null,
     private val proofFailure: Exception? = null,
     private val bundlePhase: DelegationPhase? = DelegationPhase.PCZT_BUILT,
-    private val proofDelayMillis: Long = 0
+    private val proofDelayMillis: Long = 0,
+    private val proofGate: ProofGate? = null
 ) {
     val calls = mutableListOf<CryptoCall>()
     var warmupCount = 0
@@ -429,6 +476,14 @@ private class FakeVotingCryptoClient(
                     @Suppress("ForbiddenComment")
                     if (proofDelayMillis > 0) {
                         Thread.sleep(proofDelayMillis)
+                    }
+                    proofGate?.let { gate ->
+                        gate.entered.countDown()
+                        gate.release.await(GATE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+                        gate.fvkBytes = args.valueAt<ByteArray>(6).copyOf()
+                        gate.hotkeySeed = args.valueAt<ByteArray>(7).copyOf()
+                        gate.seedFingerprint = args.valueAt<ByteArray>(8).copyOf()
+                        gate.captured.countDown()
                     }
                     synchronized(this) { activeProofs -= 1 }
                     proofFailure?.let { throw it }
