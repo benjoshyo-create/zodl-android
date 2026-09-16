@@ -1,22 +1,52 @@
 package co.electriccoin.zcash.ui.common.repository
 
+import co.electriccoin.zcash.ui.common.model.voting.DelegationPhase
 import co.electriccoin.zcash.ui.common.model.voting.VotingDelegationPirPrecomputeResult
 import co.electriccoin.zcash.ui.common.model.voting.VotingPirLayout
+import co.electriccoin.zcash.ui.common.model.voting.VotingProvingLimits
 import co.electriccoin.zcash.ui.common.provider.PirSnapshotResolver
 import co.electriccoin.zcash.ui.common.provider.VotingCryptoClient
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.coroutineContext
 
 data class VotingDelegationPirPrecomputeKey(
     val accountUuid: String,
     val roundId: String,
     val bundleIndex: Int
 )
+
+/**
+ * Everything the background ZKP1 stage needs beyond the request itself. All of it is readable at
+ * round-preparation time without authenticating the user, which is what lets the delegation proof
+ * run while the user is still answering questions.
+ *
+ * Not a data class on purpose: it holds key material, so identity - not structural equality - is
+ * what the repository tracks, and [clear] zeroes it as soon as the proof no longer needs it. Build
+ * it from copies: it outlives the call that assembled it.
+ */
+class VotingDelegationProofMaterial(
+    val fvkBytes: ByteArray,
+    val hotkeySeed: ByteArray,
+    val seedFingerprint: ByteArray,
+    val accountIndex: Int,
+    val roundName: String
+) {
+    fun clear() {
+        fvkBytes.fill(0)
+        hotkeySeed.fill(0)
+        seedFingerprint.fill(0)
+    }
+}
 
 data class VotingDelegationPirPrecomputeRequest(
     val accountUuid: String,
@@ -28,7 +58,9 @@ data class VotingDelegationPirPrecomputeRequest(
     val pirLayout: VotingPirLayout,
     val expectedSnapshotHeight: Long,
     val networkId: Int,
-    val notesJson: String
+    val notesJson: String,
+    /** Null for Keystone, whose delegation proof cannot be produced without the device. */
+    val proofMaterial: VotingDelegationProofMaterial? = null
 ) {
     val key: VotingDelegationPirPrecomputeKey
         get() =
@@ -39,6 +71,19 @@ data class VotingDelegationPirPrecomputeRequest(
             )
 }
 
+/**
+ * Any bundle's entry for this account and round. Every bundle of a round shares the endpoints, the
+ * snapshot height and the notes they were built from, so the first match answers for the round.
+ */
+private fun <T> Map<VotingDelegationPirPrecomputeKey, T>.entryForRound(
+    accountUuid: String,
+    roundId: String
+): T? =
+    entries
+        .firstOrNull { (key, _) ->
+            key.accountUuid == accountUuid && key.roundId.equals(roundId, ignoreCase = true)
+        }?.value
+
 interface VotingProofPrecomputeRepository {
     fun warmProvingCaches()
 
@@ -47,6 +92,42 @@ interface VotingProofPrecomputeRepository {
     suspend fun awaitDelegationPirPrecompute(
         key: VotingDelegationPirPrecomputeKey
     ): Result<VotingDelegationPirPrecomputeResult>?
+
+    /**
+     * The PIR endpoint a precompute for this account and round already picked, or null when none
+     * ran. Every bundle of a round shares one endpoint and one snapshot height, so any bundle's
+     * answer is the round's answer - and reusing it spares the submission a fresh probe of every
+     * configured endpoint over Tor.
+     */
+    fun resolvedPirServerUrl(
+        accountUuid: String,
+        roundId: String
+    ): String?
+
+    /**
+     * The wallet-notes JSON a precompute for this account and round was built from, or null when
+     * none ran. It is a snapshot-height read, so it cannot have changed since.
+     */
+    fun preparedNotesJson(
+        accountUuid: String,
+        roundId: String
+    ): String?
+
+    /**
+     * Waits for the background delegation proof of [key]. Null means one was never scheduled - for
+     * a Keystone round, for a bundle whose setup was not ready, or because the policy is off - and
+     * the caller should prove on demand as it always did.
+     *
+     * A proof that was itself cancelled comes back as a failure rather than cancelling the caller;
+     * only the caller's own cancellation propagates.
+     */
+    suspend fun awaitDelegationProof(key: VotingDelegationPirPrecomputeKey): Result<Unit>?
+
+    /**
+     * Cancels every pending background proof and zeroes its key material. A native proof already
+     * running cannot be interrupted mid-flight; this only stops the ones that have not started.
+     */
+    fun cancelBackgroundProofs()
 }
 
 class VotingProofPrecomputeRepositoryImpl(
@@ -58,6 +139,20 @@ class VotingProofPrecomputeRepositoryImpl(
     private val lock = Any()
     private val delegationPirJobs =
         mutableMapOf<VotingDelegationPirPrecomputeKey, Deferred<Result<VotingDelegationPirPrecomputeResult>>>()
+    private val delegationProofJobs = mutableMapOf<VotingDelegationPirPrecomputeKey, Deferred<Result<Unit>>>()
+    private val delegationNotesJson = mutableMapOf<VotingDelegationPirPrecomputeKey, String>()
+    private val resolvedPirServerUrls = mutableMapOf<VotingDelegationPirPrecomputeKey, String>()
+    private val liveProofMaterials = mutableSetOf<VotingDelegationProofMaterial>()
+
+    /**
+     * Two background proofs at once - the round's whole trimmed bundle count - so a round is warm
+     * by the time the user reaches the confirmation screen.
+     *
+     * `SubmitVotesUseCase` awaits the background proof of a bundle before proving that bundle
+     * itself, so a background ZKP1 and a foreground proof of the same bundle never overlap; a
+     * foreground proof of another bundle shares the cores with at most these two.
+     */
+    private val proofPermits = Semaphore(VotingProvingLimits.MAX_CONCURRENT_PROOFS)
 
     override fun warmProvingCaches() {
         if (!warmupStarted.compareAndSet(false, true)) {
@@ -72,12 +167,18 @@ class VotingProofPrecomputeRepositoryImpl(
 
     override fun startDelegationPirPrecompute(request: VotingDelegationPirPrecomputeRequest) {
         synchronized(lock) {
+            delegationNotesJson[request.key] = request.notesJson
             val existing = delegationPirJobs[request.key]
             if (existing != null && !existing.isCancelled) {
                 return
             }
 
             delegationPirJobs[request.key] = scope.async { runPrecompute(request) }
+            val proofMaterial = request.proofMaterial
+            if (proofMaterial != null) {
+                liveProofMaterials += proofMaterial
+                delegationProofJobs[request.key] = scope.async { runProofStage(request, proofMaterial) }
+            }
         }
     }
 
@@ -85,6 +186,133 @@ class VotingProofPrecomputeRepositoryImpl(
         key: VotingDelegationPirPrecomputeKey
     ): Result<VotingDelegationPirPrecomputeResult>? =
         synchronized(lock) { delegationPirJobs[key] }?.await()
+
+    override fun resolvedPirServerUrl(
+        accountUuid: String,
+        roundId: String
+    ): String? = synchronized(lock) { resolvedPirServerUrls.entryForRound(accountUuid, roundId) }
+
+    override fun preparedNotesJson(
+        accountUuid: String,
+        roundId: String
+    ): String? = synchronized(lock) { delegationNotesJson.entryForRound(accountUuid, roundId) }
+
+    override suspend fun awaitDelegationProof(key: VotingDelegationPirPrecomputeKey): Result<Unit>? {
+        val job = synchronized(lock) { delegationProofJobs[key] } ?: return null
+        return try {
+            job.await()
+        } catch (exception: CancellationException) {
+            coroutineContext.ensureActive()
+            Result.failure(exception)
+        }
+    }
+
+    override fun cancelBackgroundProofs() {
+        val (jobs, materials) =
+            synchronized(lock) {
+                val jobs = delegationProofJobs.values.toList()
+                val materials = liveProofMaterials.toList()
+                delegationProofJobs.clear()
+                resolvedPirServerUrls.clear()
+                liveProofMaterials.clear()
+                jobs to materials
+            }
+        jobs.forEach { job -> job.cancel() }
+        materials.forEach { material -> material.clear() }
+    }
+
+    /**
+     * The PIR data the proof reads is exactly what [runPrecompute] warms, so the proof waits for it
+     * rather than duplicating the fetch. A failed or absent precompute fails the proof stage; the
+     * caller then proves on demand as before.
+     *
+     * The stage holds one DB handle from before the precompute wait until after the proof, rather
+     * than opening one per step: every job's handle then overlaps the others', so the Rust handle
+     * and the PIR client it caches live from the round's first precompute to its last proof. The
+     * handle is opened after the first cancellation check and closed in the finally, so a job
+     * cancelled before it starts opens nothing and one cancelled later still releases it.
+     */
+    private suspend fun runProofStage(
+        request: VotingDelegationPirPrecomputeRequest,
+        material: VotingDelegationProofMaterial
+    ): Result<Unit> =
+        runCatching {
+            coroutineContext.ensureActive()
+            val dbHandle = votingCryptoClient.openVotingDb(request.votingDbPath)
+            check(dbHandle != 0L) { "Failed to open voting DB at ${request.votingDbPath}" }
+            try {
+                votingCryptoClient.setWalletId(dbHandle, request.walletId, request.networkId)
+                val pirOutcome =
+                    requireNotNull(awaitDelegationPirPrecompute(request.key)) {
+                        "Voting PIR precompute was never scheduled for round ${request.roundId} " +
+                            "bundle ${request.bundleIndex}"
+                    }
+                pirOutcome.getOrThrow()
+                val pirServerUrl =
+                    requireNotNull(synchronized(lock) { resolvedPirServerUrls[request.key] }) {
+                        "Voting PIR server URL is missing for round ${request.roundId} " +
+                            "bundle ${request.bundleIndex}"
+                    }
+                proofPermits.withPermit { runProof(request, material, pirServerUrl, dbHandle) }
+            } finally {
+                votingCryptoClient.closeVotingDb(dbHandle)
+                synchronized(lock) { liveProofMaterials -= material }
+                material.clear()
+            }
+        }
+
+    /**
+     * Produces the delegation proof on the stage's [dbHandle].
+     *
+     * Waiting for the permit can take a long time, so the round is re-checked before proving one
+     * whose round may since have been torn down. Only a bundle that is
+     * [DelegationPhase.PCZT_BUILT] has the alpha this proof binds to; anything else is either not
+     * ready yet or already past the proof, and proving it would be wasted work.
+     *
+     * The proof reads copies of the key material rather than [material]'s own arrays:
+     * [cancelBackgroundProofs] zeroes those immediately, and a native proof already under way
+     * cannot be interrupted, so it would otherwise read zeroed secrets mid-flight. The copies are
+     * zeroed as soon as the proof returns.
+     */
+    private suspend fun runProof(
+        request: VotingDelegationPirPrecomputeRequest,
+        material: VotingDelegationProofMaterial,
+        pirServerUrl: String,
+        dbHandle: Long
+    ) {
+        coroutineContext.ensureActive()
+        val phase =
+            votingCryptoClient
+                .delegationPhases(dbHandle, request.roundId)
+                .firstOrNull { bundle -> bundle.bundleIndex == request.bundleIndex }
+                ?.phase
+        check(phase == DelegationPhase.PCZT_BUILT) {
+            "Voting bundle ${request.bundleIndex} of round ${request.roundId} is $phase, " +
+                "not ${DelegationPhase.PCZT_BUILT}"
+        }
+        val fvkBytes = material.fvkBytes.copyOf()
+        val hotkeySeed = material.hotkeySeed.copyOf()
+        val seedFingerprint = material.seedFingerprint.copyOf()
+        try {
+            votingCryptoClient.buildAndProveDelegation(
+                dbHandle = dbHandle,
+                roundId = request.roundId,
+                bundleIndex = request.bundleIndex,
+                pirServerUrl = pirServerUrl,
+                pirLayout = request.pirLayout,
+                notesJson = request.notesJson,
+                fvkBytes = fvkBytes,
+                hotkeySeed = hotkeySeed,
+                seedFingerprint = seedFingerprint,
+                accountIndex = material.accountIndex,
+                roundName = material.roundName
+            )
+        } finally {
+            fvkBytes.fill(0)
+            hotkeySeed.fill(0)
+            seedFingerprint.fill(0)
+        }
+    }
 
     private suspend fun runPrecompute(
         request: VotingDelegationPirPrecomputeRequest
@@ -95,6 +323,7 @@ class VotingProofPrecomputeRepositoryImpl(
                     endpoints = request.pirEndpoints,
                     expectedSnapshotHeight = request.expectedSnapshotHeight
                 )
+            synchronized(lock) { resolvedPirServerUrls[request.key] = pirServerUrl }
             val dbHandle = votingCryptoClient.openVotingDb(request.votingDbPath)
             check(dbHandle != 0L) { "Failed to open voting DB at ${request.votingDbPath}" }
 

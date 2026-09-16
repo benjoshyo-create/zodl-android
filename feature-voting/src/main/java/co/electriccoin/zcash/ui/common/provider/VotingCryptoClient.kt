@@ -39,11 +39,13 @@ import co.electriccoin.zcash.ui.common.model.voting.VotingVoteRecord
 import co.electriccoin.zcash.ui.common.model.voting.requireKnownPolyLen
 import co.electriccoin.zcash.ui.common.model.voting.toVoteCommitmentBundle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import cash.z.ecc.android.sdk.model.voting.VotingBundleSetupResult as SdkVotingBundleSetupResult
 import cash.z.ecc.android.sdk.model.voting.VotingCommitmentBundleRecord as SdkVotingCommitmentBundleRecord
@@ -218,6 +220,20 @@ interface VotingCryptoClient {
         notesJson: String,
         witnessesJson: String
     )
+
+    /**
+     * True when this bundle already has a stored witness for every note, so generating and storing
+     * them again would only repeat work an earlier run or the background stage already did.
+     *
+     * @throws RuntimeException if the native layer reports a failure.
+     */
+    @Throws(RuntimeException::class)
+    suspend fun hasCompleteWitnesses(
+        dbHandle: Long,
+        roundId: String,
+        bundleIndex: Int,
+        notesJson: String
+    ): Boolean
 
     /** @throws RuntimeException if the native layer reports a failure. */
     @Throws(RuntimeException::class)
@@ -549,8 +565,8 @@ class VotingCryptoClientImpl : VotingCryptoClient {
     private val nextDbHandle = AtomicLong(1)
     private val sdkMutex = Mutex()
     private var sdk: VotingSdk? = null
-    private val dbPaths = mutableMapOf<Long, String>()
-    private val sessions = mutableMapOf<Long, VotingDbSession>()
+    private val dbPaths = ConcurrentHashMap<Long, String>()
+    private val sessions = ConcurrentHashMap<Long, VotingDbSession>()
 
     private suspend fun votingSdk(): VotingSdk =
         sdk ?: sdkMutex.withLock {
@@ -568,8 +584,9 @@ class VotingCryptoClientImpl : VotingCryptoClient {
         return handle
     }
 
+    /** Non-cancellable: a cancelled background job must still release its native session. */
     override suspend fun closeVotingDb(dbHandle: Long) {
-        withContext(Dispatchers.IO) {
+        withContext(NonCancellable + Dispatchers.IO) {
             sessions.remove(dbHandle)?.close()
             dbPaths.remove(dbHandle)
         }
@@ -757,6 +774,16 @@ class VotingCryptoClientImpl : VotingCryptoClient {
                 notesJson.toVotingNoteInfos(),
                 witnessesJson.toVotingWitnesses()
             )
+        }
+
+    override suspend fun hasCompleteWitnesses(
+        dbHandle: Long,
+        roundId: String,
+        bundleIndex: Int,
+        notesJson: String
+    ): Boolean =
+        withContext(Dispatchers.IO) {
+            session(dbHandle).hasCompleteWitnesses(roundId, bundleIndex, notesJson.toVotingNoteInfos())
         }
 
     override suspend fun buildGovernancePczt(
