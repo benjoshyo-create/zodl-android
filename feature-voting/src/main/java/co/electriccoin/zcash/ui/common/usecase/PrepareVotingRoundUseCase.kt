@@ -8,22 +8,30 @@ import cash.z.ecc.android.sdk.model.ZcashNetwork
 import co.electriccoin.zcash.ui.common.model.KeystoneAccount
 import co.electriccoin.zcash.ui.common.model.voting.DelegationPhase
 import co.electriccoin.zcash.ui.common.model.voting.VoteIneligibilityReason
+import co.electriccoin.zcash.ui.common.model.voting.VotingBackgroundProofPolicy
 import co.electriccoin.zcash.ui.common.model.voting.VotingBundleSetupResult
+import co.electriccoin.zcash.ui.common.model.voting.VotingBundleTrim
 import co.electriccoin.zcash.ui.common.model.voting.VotingErrors
 import co.electriccoin.zcash.ui.common.model.voting.VotingPirLayout
 import co.electriccoin.zcash.ui.common.model.voting.VotingRoundPreparationResult
+import co.electriccoin.zcash.ui.common.model.voting.VotingSession
 import co.electriccoin.zcash.ui.common.model.voting.VotingSubmissionRecoverableException
+import co.electriccoin.zcash.ui.common.model.voting.computeTrimmedBundleKeepCount
 import co.electriccoin.zcash.ui.common.model.voting.isDelegationSetupOverwrite
 import co.electriccoin.zcash.ui.common.model.voting.requireKnownPolyLen
+import co.electriccoin.zcash.ui.common.model.voting.trimmedTo
+import co.electriccoin.zcash.ui.common.model.voting.votingBundleRawWeights
 import co.electriccoin.zcash.ui.common.provider.SynchronizerProvider
 import co.electriccoin.zcash.ui.common.provider.VotingCryptoClient
 import co.electriccoin.zcash.ui.common.provider.VotingHotkeySeedProvider
 import co.electriccoin.zcash.ui.common.repository.VotingDelegationPirPrecomputeRequest
+import co.electriccoin.zcash.ui.common.repository.VotingDelegationProofMaterial
 import co.electriccoin.zcash.ui.common.repository.VotingEligibility
 import co.electriccoin.zcash.ui.common.repository.VotingProofPrecomputeRepository
 import co.electriccoin.zcash.ui.common.repository.VotingRecoveryRepository
 import co.electriccoin.zcash.ui.common.repository.VotingRecoverySnapshot
 import co.electriccoin.zcash.ui.common.repository.VotingSessionStore
+import co.electriccoin.zcash.ui.common.repository.preparedBundleSetup
 import co.electriccoin.zcash.ui.common.repository.toVotingAccountScopeId
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -61,19 +69,7 @@ class PrepareVotingRoundUseCase(
             }
 
             val synchronizer = synchronizerProvider.getSynchronizer()
-            val scannedHeight = awaitFullyScannedHeight(synchronizer)
-            if (scannedHeight == null || scannedHeight < session.snapshotHeight) {
-                Log.i(
-                    TAG,
-                    "WalletSyncing gate tripped for round $roundId: scannedHeight=$scannedHeight " +
-                        "snapshotHeight=${session.snapshotHeight} network=${synchronizer.network.networkName}"
-                )
-                votingSessionStore.setEligibility(VotingEligibility.WALLET_SYNCING)
-                return@withContext VotingRoundPreparationResult.WalletSyncing(
-                    scannedHeight = scannedHeight,
-                    snapshotHeight = session.snapshotHeight
-                )
-            }
+            awaitWalletSynced(session)?.let { walletSyncing -> return@withContext walletSyncing }
 
             val selectedAccount = getSelectedWalletAccount()
             val accountUuid = selectedAccount.sdkAccount.accountUuid
@@ -115,6 +111,7 @@ class PrepareVotingRoundUseCase(
                     when (existingRoundRecoveryAction) {
                         ExistingRoundRecoveryAction.REINITIALIZE -> {
                             Log.i(TAG, "Reinitializing verified empty voting round $roundId")
+                            votingProofPrecomputeRepository.cancelBackgroundProofs()
                             votingCryptoClient.clearRound(dbHandle, roundId)
                             votingCryptoClient.clearRecoveryState(dbHandle, roundId)
                             votingRecoveryRepository.clearRound(accountUuidString, roundId)
@@ -158,6 +155,7 @@ class PrepareVotingRoundUseCase(
                             freshNotesJson = notesJson
                             roundNotesJson = notesJson
 
+                            votingProofPrecomputeRepository.cancelBackgroundProofs()
                             votingCryptoClient.initializeRound(
                                 dbHandle = dbHandle,
                                 roundId = roundId,
@@ -173,13 +171,13 @@ class PrepareVotingRoundUseCase(
                                     dbHandle = dbHandle,
                                     roundId = roundId,
                                     notesJson = notesJson
-                                ).also { setup ->
-                                    votingRecoveryRepository.storeBundleSetup(
+                                ).let { setup ->
+                                    trimAndStoreBundleSetup(
                                         accountUuid = accountUuidString,
                                         roundId = roundId,
-                                        bundleCount = setup.bundleCount,
-                                        eligibleWeight = setup.eligibleWeight,
-                                        bundleWeights = setup.bundleWeights
+                                        dbHandle = dbHandle,
+                                        setup = setup,
+                                        notesJson = notesJson
                                     )
                                 }.let { setup -> setup.bundleCount to setup.eligibleWeight }
                         } else {
@@ -345,6 +343,95 @@ class PrepareVotingRoundUseCase(
             preparationResult
         }
 
+    /**
+     * Applies the privacy trim to a freshly built bundle setup and persists the result.
+     *
+     * The notes JSON is deliberately left untouched: the JNI re-chunks the full note list at every
+     * later step and asserts the result matches the stored bundle rows. The supported way to end up
+     * with fewer bundles is therefore the same "skipped suffix" the Keystone skip flow uses —
+     * delete the value-DESC tail rows and keep the prefix exactly as it was built.
+     */
+    private suspend fun trimAndStoreBundleSetup(
+        accountUuid: String,
+        roundId: String,
+        dbHandle: Long,
+        setup: VotingBundleSetupResult,
+        notesJson: String
+    ): VotingBundleSetupResult {
+        val keepCount =
+            if (setup.bundleWeights.size < setup.bundleCount) {
+                Log.w(TAG, "Voting round $roundId has no per-bundle weights; skipping the privacy trim")
+                setup.bundleCount
+            } else {
+                computeTrimmedBundleKeepCount(trimWeightsFor(setup, notesJson, roundId))
+            }
+
+        if (keepCount >= setup.bundleCount) {
+            votingRecoveryRepository.storeBundleSetup(
+                accountUuid = accountUuid,
+                roundId = roundId,
+                bundleCount = setup.bundleCount,
+                eligibleWeight = setup.eligibleWeight,
+                bundleWeights = setup.bundleWeights
+            )
+            return setup
+        }
+
+        val trim =
+            VotingBundleTrim(
+                keepCount = keepCount,
+                trimmedBundleCount = setup.bundleCount - keepCount,
+                trimmedWeight = setup.bundleWeights.drop(keepCount).sum()
+            )
+        Log.i(
+            TAG,
+            "Trimming voting round $roundId from ${setup.bundleCount} to $keepCount bundles " +
+                "(${trim.trimmedWeight} zatoshi of voting weight dropped)"
+        )
+        votingCryptoClient.deleteSkippedBundles(
+            dbHandle = dbHandle,
+            roundId = roundId,
+            keepCount = keepCount
+        )
+        val trimmedSetup = setup.trimmedTo(keepCount)
+        votingRecoveryRepository.storeBundleSetup(
+            accountUuid = accountUuid,
+            roundId = roundId,
+            bundleCount = trimmedSetup.bundleCount,
+            eligibleWeight = trimmedSetup.eligibleWeight,
+            bundleWeights = trimmedSetup.bundleWeights,
+            trimmedBundleCount = trim.trimmedBundleCount,
+            trimmedWeight = trim.trimmedWeight
+        )
+        return trimmedSetup
+    }
+
+    /**
+     * Raw (un-quantized) bundle totals drive the trim budget so it matches the crate's own rule.
+     * When the Kotlin chunker disagrees with the native bundle count the quantized weights are the
+     * only trustworthy fallback; they differ by less than one ballot divisor per bundle.
+     */
+    private fun trimWeightsFor(
+        setup: VotingBundleSetupResult,
+        notesJson: String,
+        roundId: String
+    ): List<Long> {
+        val rawWeights =
+            runCatching { votingBundleRawWeights(notesJson) }
+                .onFailure { throwable ->
+                    Log.w(TAG, "Unable to derive raw voting bundle weights for round $roundId", throwable)
+                }.getOrDefault(emptyList())
+        if (rawWeights.size == setup.bundleCount) {
+            return rawWeights
+        }
+        Log.w(
+            TAG,
+            "Raw voting bundle weights (${rawWeights.size}) do not match the prepared bundle count " +
+                "(${setup.bundleCount}) for round $roundId; trimming on quantized weights instead"
+        )
+        return setup.bundleWeights
+    }
+
     private suspend fun recoverExistingBundleSetup(
         accountUuid: String,
         roundId: String,
@@ -383,22 +470,11 @@ class PrepareVotingRoundUseCase(
             roundId = roundId,
             bundleCount = recoveredSetup.bundleCount,
             eligibleWeight = recoveredSetup.eligibleWeight,
-            bundleWeights = recoveredSetup.bundleWeights
+            bundleWeights = recoveredSetup.bundleWeights,
+            trimmedBundleCount = computedSetup.bundleCount - dbBundleCount,
+            trimmedWeight = computedSetup.bundleWeights.drop(dbBundleCount).sum()
         )
         return recoveredSetup
-    }
-
-    private fun VotingRecoverySnapshot.preparedBundleSetup(): VotingBundleSetupResult? {
-        val count = bundleCount ?: return null
-        val weight = eligibleWeight ?: return null
-        if (bundleWeights.size < count) {
-            return null
-        }
-        return VotingBundleSetupResult(
-            bundleCount = count,
-            eligibleWeight = weight,
-            bundleWeights = bundleWeights.take(count)
-        )
     }
 
     private suspend fun storeRecoveredHotkeyAddress(
@@ -448,6 +524,12 @@ class PrepareVotingRoundUseCase(
         }
     }
 
+    /**
+     * Builds the per-bundle precompute requests for a software wallet, each carrying the material
+     * the background delegation proof needs. The Orchard FVK is read once for the whole round: it
+     * is the same bytes for every bundle, and a failure reading it must leave PIR precompute
+     * running rather than disable it too.
+     */
     private suspend fun buildSoftwareDelegationPirPrecomputeRequests(
         accountUuid: String,
         walletId: String,
@@ -468,6 +550,16 @@ class PrepareVotingRoundUseCase(
         expectedSnapshotHeight: Long
     ): List<VotingDelegationPirPrecomputeRequest> {
         val requests = mutableListOf<VotingDelegationPirPrecomputeRequest>()
+        val fvkBytes =
+            if (VotingBackgroundProofPolicy.ENABLED) {
+                runCatching {
+                    votingCryptoClient.extractOrchardFvkFromUfvk(ufvk = ufvk, networkId = networkId)
+                }.onFailure { throwable ->
+                    Log.w(TAG, "Skipping background voting delegation proofs for round $roundId", throwable)
+                }.getOrNull()
+            } else {
+                null
+            }
         val phaseByBundle =
             votingCryptoClient
                 .delegationPhases(dbHandle, roundId)
@@ -516,7 +608,17 @@ class PrepareVotingRoundUseCase(
                         pirLayout = pirLayout,
                         expectedSnapshotHeight = expectedSnapshotHeight,
                         networkId = networkId,
-                        notesJson = notesJson
+                        notesJson = notesJson,
+                        proofMaterial =
+                            fvkBytes?.let { fvk ->
+                                VotingDelegationProofMaterial(
+                                    fvkBytes = fvk.copyOf(),
+                                    hotkeySeed = hotkeySeed.copyOf(),
+                                    seedFingerprint = seedFingerprint.copyOf(),
+                                    accountIndex = accountIndex,
+                                    roundName = roundName
+                                )
+                            }
                     )
             }.onFailure { throwable ->
                 // Deliberately error-level, not warn: a swallowed construct failure here is
@@ -527,6 +629,35 @@ class PrepareVotingRoundUseCase(
             }
         }
         return requests
+    }
+
+    /**
+     * The wallet-synced gate, null once the wallet has scanned past this round's snapshot height.
+     * A non-null result has already recorded [VotingEligibility.WALLET_SYNCING], so the caller only
+     * has to surface it.
+     *
+     * Kept callable on its own because a submission that skips preparation - the confirm screen
+     * already prepared this round - must still run it: the wallet can fall behind the snapshot
+     * between that screen and the tap that starts the submission, and voting against an unscanned
+     * wallet builds the round's bundles from notes that are not all there.
+     */
+    internal suspend fun awaitWalletSynced(session: VotingSession): VotingRoundPreparationResult.WalletSyncing? {
+        val synchronizer = synchronizerProvider.getSynchronizer()
+        val scannedHeight = awaitFullyScannedHeight(synchronizer)
+        if (scannedHeight != null && scannedHeight >= session.snapshotHeight) {
+            return null
+        }
+        Log.i(
+            TAG,
+            "WalletSyncing gate tripped for round ${session.voteRoundId.toHex()}: " +
+                "scannedHeight=$scannedHeight snapshotHeight=${session.snapshotHeight} " +
+                "network=${synchronizer.network.networkName}"
+        )
+        votingSessionStore.setEligibility(VotingEligibility.WALLET_SYNCING)
+        return VotingRoundPreparationResult.WalletSyncing(
+            scannedHeight = scannedHeight,
+            snapshotHeight = session.snapshotHeight
+        )
     }
 
     private suspend fun awaitFullyScannedHeight(synchronizer: Synchronizer): Long? {

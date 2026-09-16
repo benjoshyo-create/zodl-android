@@ -31,6 +31,7 @@ import co.electriccoin.zcash.ui.common.model.voting.VotingPirLayout
 import co.electriccoin.zcash.ui.common.model.voting.VotingRoundPreparationResult
 import co.electriccoin.zcash.ui.common.model.voting.VotingServiceConfig
 import co.electriccoin.zcash.ui.common.model.voting.VotingSession
+import co.electriccoin.zcash.ui.common.model.voting.VotingShareDelegationRecord
 import co.electriccoin.zcash.ui.common.model.voting.VotingSubmissionRecoverableException
 import co.electriccoin.zcash.ui.common.model.voting.VotingTxHashLookup
 import co.electriccoin.zcash.ui.common.model.voting.VotingVoteCommitment
@@ -49,12 +50,25 @@ import co.electriccoin.zcash.ui.common.repository.VotingRecoverySnapshot
 import co.electriccoin.zcash.ui.common.repository.VotingSessionStore
 import co.electriccoin.zcash.ui.common.repository.toVotingAccountScopeId
 import co.electriccoin.zcash.work.VotingShareTrackingScheduler
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.respondOk
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.verify
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import java.io.EOFException
 import java.time.Instant
 import java.util.Base64
@@ -64,14 +78,17 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
+@Suppress("LargeClass")
 class SubmitVotesUseCaseRecoveryTest {
     @Test
     fun duplicateDelegationPersistsVanPositionAndRestartSkipsRecoveredBundle() =
         runTest {
             val fixture = RecoveryFixture(keystoneAccount())
 
+            // Both bundles prove at once and then queue for the post lock, so the chains run on the
+            // test scheduler to keep the order they reach that lock in deterministic.
             assertFailsWith<FirstRunInterrupted> {
-                fixture.newUseCase()(ROUND_ID, mapOf(1 to 0))
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
             }
 
             assertEquals(DelegationPhase.CONFIRMED, fixture.delegationPhases[0])
@@ -81,7 +98,7 @@ class SubmitVotesUseCaseRecoveryTest {
             assertEquals(listOf(1L..20L, 11L..20L), fixture.requestedLeafRanges)
 
             assertFailsWith<ContinuationReached> {
-                fixture.newUseCase()(ROUND_ID, mapOf(1 to 0))
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
             }
 
             assertEquals(1, fixture.submissionCounts.getValue(0))
@@ -154,7 +171,7 @@ class SubmitVotesUseCaseRecoveryTest {
                 )
 
             assertFailsWith<FirstRunInterrupted> {
-                fixture.newUseCase()(ROUND_ID, mapOf(1 to 0))
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
             }
 
             assertEquals(DelegationPhase.CONFIRMED, fixture.delegationPhases[0])
@@ -349,13 +366,14 @@ class SubmitVotesUseCaseRecoveryTest {
                     submitted = false
                 )
 
-            val result = fixture.newUseCase()(ROUND_ID, mapOf(3 to 0, 5 to 0))
+            val result =
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(3 to 0, 5 to 0))
 
             assertEquals(2, result.submittedProposalCount)
-            assertEquals(
-                listOf(0 to 5, 1 to 5, 0 to 3, 1 to 3),
-                fixture.builtVoteTargets
-            )
+            // Chains run concurrently, so only per-chain order is defined: every chain still
+            // finishes the unresolved proposal before it touches the fresh one.
+            assertEquals(listOf(0 to 5, 0 to 3), fixture.builtVoteTargets.filter { it.first == 0 })
+            assertEquals(listOf(1 to 5, 1 to 3), fixture.builtVoteTargets.filter { it.first == 1 })
         }
 
     @Test
@@ -472,6 +490,495 @@ class SubmitVotesUseCaseRecoveryTest {
             assertEquals(VotingRecoveryPhase.DELEGATION_SUBMITTED, fixture.recovery.phase)
         }
 
+    @Test
+    fun twoBundlesPostBothBeforeAnyConfirmation() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    bundleCount = 2,
+                    successfulVoteSubmissions = true
+                )
+
+            val result =
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
+
+            assertEquals(1, result.submittedProposalCount)
+            assertEquals(
+                setOf("post:0", "post:1", "confirm:accepted-0-1", "confirm:accepted-1-1"),
+                fixture.apiCallLog.toSet()
+            )
+            // Neither chain waits on a confirmation before the other one has broadcast.
+            assertEquals(2, fixture.apiCallLog.count { entry -> entry.startsWith("post:") })
+            assertTrue(fixture.apiCallLog.indexOfFirst { it.startsWith("confirm:") } >= 1)
+        }
+
+    @Test
+    fun chainsRunAtMostTwoProofsAtOnce() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    proposalCount = 2,
+                    bundleCount = 2,
+                    successfulVoteSubmissions = true,
+                    proofConcurrencyTarget = 2
+                )
+
+            fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0, 2 to 0))
+
+            // Each proof blocks until a second one has entered, so a run that still serialized
+            // proving would time out inside the fake instead of reaching this assertion.
+            assertEquals(2, fixture.maxConcurrentProofs)
+        }
+
+    @Test
+    fun chainsNeverRunMoreThanTwoProofsAtOnce() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    proposalCount = 2,
+                    bundleCount = 3,
+                    successfulVoteSubmissions = true,
+                    proofConcurrencyTarget = 2
+                )
+
+            fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0, 2 to 0))
+
+            assertEquals(2, fixture.maxConcurrentProofs)
+        }
+
+    @Test
+    fun castVotePostsAreSerializedAcrossChains() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    proposalCount = 2,
+                    bundleCount = 3,
+                    successfulVoteSubmissions = true
+                )
+
+            fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0, 2 to 0))
+
+            assertEquals(1, fixture.maxConcurrentPosts)
+        }
+
+    @Test
+    fun perChainClientsAreUsedWhenFactoryProvidesThem() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    bundleCount = 2,
+                    successfulVoteSubmissions = true,
+                    chainClientFactory = VoteChainClientFactory { HttpClient(MockEngine { respondOk() }) }
+                )
+
+            fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
+
+            // Two posts plus two confirmations, all through the chain's own client.
+            assertEquals(4, fixture.perChainClientCalls)
+        }
+
+    @Test
+    fun resumedChainsStartAtTheirOwnFirstUnfinishedQuestion() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    bundleCount = 2,
+                    successfulVoteSubmissions = true
+                )
+            // Bundle 0 already cast this proposal's vote on a previous run; bundle 1 did not.
+            fixture.persistedVotes +=
+                VotingVoteRecord(
+                    proposalId = 1,
+                    bundleIndex = 0,
+                    choice = 0,
+                    submitted = true
+                )
+
+            val result =
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
+
+            assertEquals(1, result.submittedProposalCount)
+            assertEquals(listOf(1 to 1), fixture.builtVoteTargets)
+        }
+
+    @Test
+    fun chainFailureCancelsSiblingsAndRethrowsFirstFailure() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    proposalCount = 3,
+                    bundleCount = 2,
+                    successfulVoteSubmissions = true,
+                    rejectedConfirmationBundleIndex = 1
+                )
+
+            val failure =
+                assertFailsWith<IllegalStateException> {
+                    fixture.newUseCase(StandardTestDispatcher(testScheduler))(
+                        ROUND_ID,
+                        mapOf(1 to 0, 2 to 0, 3 to 0)
+                    )
+                }
+
+            assertEquals("vote commitment rejected", failure.message)
+            // The surviving chain is cancelled instead of racing ahead through the remaining
+            // questions on its own.
+            assertTrue(fixture.builtVoteTargets.none { (_, proposalId) -> proposalId == 3 })
+            assertEquals(VotingRecoveryPhase.DELEGATION_SUBMITTED, fixture.recovery.phase)
+        }
+
+    @Test
+    fun treeSyncRunsOncePerQuestionForAllBundles() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    proposalCount = 2,
+                    bundleCount = 2,
+                    successfulVoteSubmissions = true
+                )
+
+            val result =
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0, 2 to 0))
+
+            assertEquals(2, result.submittedProposalCount)
+            // Concurrent chains coalesce onto one sync per confirmation drain, so the count stays
+            // well under one sync per (bundle, question) pair while never dropping below one per
+            // question.
+            assertTrue(fixture.treeSyncCalls in 2..3, "unexpected sync count ${fixture.treeSyncCalls}")
+        }
+
+    @Test
+    fun chainFailureKeepsSiblingPersistedVanPosition() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    bundleCount = 2,
+                    successfulVoteSubmissions = true,
+                    rejectedConfirmationBundleIndex = 1
+                )
+
+            assertFailsWith<IllegalStateException> {
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
+            }
+
+            // Both bundles were broadcast and their hashes persisted before any wait started, so a
+            // retry resumes both from their cached hashes rather than re-proving.
+            assertEquals(setOf("accepted-0-1", "accepted-1-1"), fixture.storedVoteHashes.toSet())
+            // The chain that did confirm keeps its positions; cancelling its sibling cannot undo
+            // state the JNI already persisted.
+            assertEquals(listOf(StoredVanPosition(bundleIndex = 0, position = 7)), fixture.storedVanPositions)
+            assertEquals(listOf(12L), fixture.recordedVcPositions)
+        }
+
+    @Test
+    fun delegationChainsConfirmEveryBundleBeforeVotesStart() =
+        runTest {
+            val fixture = RecoveryFixture(keystoneAccount(), successfulDelegations = true)
+
+            assertFailsWith<ContinuationReached> {
+                fixture.newUseCase()(ROUND_ID, mapOf(1 to 0))
+            }
+
+            assertEquals(
+                setOf("post:0", "post:1", "confirm:bundle-0-tx", "confirm:bundle-1-tx"),
+                fixture.apiCallLog.toSet()
+            )
+            assertEquals(setOf("bundle-0-tx", "bundle-1-tx"), fixture.storedDelegationHashes.toSet())
+            // DELEGATION_SUBMITTED is only written once every chain has confirmed.
+            assertEquals(VotingRecoveryPhase.DELEGATION_SUBMITTED, fixture.recovery.phase)
+        }
+
+    @Test
+    fun delegationBundlesProveTwoAtOnce() =
+        runTest {
+            val fixture =
+                RecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    successfulDelegations = true,
+                    proofConcurrencyTarget = 2,
+                    initialDelegationPhase = DelegationPhase.PCZT_BUILT
+                )
+
+            assertFailsWith<ContinuationReached> {
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
+            }
+
+            // Each proof blocks until its sibling has entered, so a run that still serialized
+            // proving would time out inside the fake instead of reaching this assertion.
+            assertEquals(2, fixture.maxConcurrentDelegationProofs)
+        }
+
+    @Test
+    fun delegationPostsAreSerializedAcrossBundles() =
+        runTest {
+            val fixture =
+                RecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    successfulDelegations = true,
+                    proofConcurrencyTarget = 2,
+                    initialDelegationPhase = DelegationPhase.PCZT_BUILT
+                )
+
+            assertFailsWith<ContinuationReached> {
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
+            }
+
+            // The vote server has no idempotency key, so broadcasts stay one at a time even though
+            // the proofs that precede them overlap.
+            assertEquals(1, fixture.maxConcurrentDelegationPosts)
+        }
+
+    @Test
+    fun delegationConfirmationPollsTheAcceptingServerUntilTheTxIsIndexed() =
+        runTest {
+            val fixture =
+                RecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    successfulDelegations = true,
+                    acceptingServerUrl = ACCEPTING_SERVER_URL,
+                    notIndexedConfirmationAttempts = 2
+                )
+
+            assertFailsWith<ContinuationReached> {
+                fixture.newUseCase()(ROUND_ID, mapOf(1 to 0))
+            }
+
+            val bundleCalls = fixture.confirmationCalls.filter { call -> call.txHash == "bundle-0-tx" }
+            assertEquals(3, bundleCalls.size)
+            assertEquals(
+                listOf(ACCEPTING_SERVER_URL),
+                bundleCalls.map { call -> call.preferredServerUrl }.distinct()
+            )
+        }
+
+    /**
+     * The accepting server's indexer never answers for this transaction, so the poll that finally
+     * confirms it is the one that asks the other vote servers as well.
+     */
+    @Test
+    fun confirmationPollsConsultTheOtherVoteServersEveryEighthAttempt() =
+        runTest {
+            val fixture =
+                RecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    successfulDelegations = true,
+                    acceptingServerUrl = ACCEPTING_SERVER_URL,
+                    preferredServerNeverIndexes = true
+                )
+
+            assertFailsWith<ContinuationReached> {
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
+            }
+
+            val bundleCalls = fixture.confirmationCalls.filter { call -> call.txHash == "bundle-0-tx" }
+            assertEquals(8, bundleCalls.size)
+            assertEquals(List(7) { false } + true, bundleCalls.map { call -> call.consultOthers })
+            assertEquals(
+                listOf(ACCEPTING_SERVER_URL),
+                bundleCalls.map { call -> call.preferredServerUrl }.distinct()
+            )
+        }
+
+    @Test
+    fun shareDeliveryFailureDoesNotBlockNextQuestion() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    proposalCount = 2,
+                    successfulVoteSubmissions = true,
+                    failingShareProposalId = 1
+                )
+
+            val failure =
+                assertFailsWith<VotingShareDeliveryException> {
+                    fixture.newUseCase()(ROUND_ID, mapOf(1 to 0, 2 to 0))
+                }
+
+            // The failure names the question whose shares never landed, and keeps its own cause.
+            assertEquals(0, failure.bundleIndex)
+            assertEquals(1, failure.proposalId)
+            assertEquals("share helper unavailable", failure.cause?.message)
+            // Both votes still reached the chain, and only proposal 2's share was recorded.
+            assertEquals(listOf(1, 2), fixture.submittedBundles.map { bundle -> bundle.proposalId })
+            assertEquals(listOf(0), fixture.recordedShares)
+            // The failure surfaces after every vote is on chain, never before the next question.
+            assertEquals(VotingRecoveryPhase.VOTES_SUBMITTED, fixture.recovery.phase)
+        }
+
+    /**
+     * Every vote of the failed run is already on chain, so the retry casts nothing and only
+     * resends the shares of the question whose delivery failed.
+     */
+    @Test
+    fun retryResendsOnlyTheHelperSharesThatNeverLanded() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    proposalCount = 2,
+                    successfulVoteSubmissions = true,
+                    failingShareProposalId = 1
+                )
+
+            assertFailsWith<VotingShareDeliveryException> {
+                fixture.newUseCase()(ROUND_ID, mapOf(1 to 0, 2 to 0))
+            }
+
+            assertEquals(VotingRecoveryPhase.VOTES_SUBMITTED, fixture.recovery.phase)
+            assertEquals(listOf(1, 2), fixture.startedShareDeliveries)
+            assertEquals(listOf(0), fixture.recordedShares)
+
+            fixture.failingShareProposalId = null
+            val result = fixture.newUseCase()(ROUND_ID, mapOf(1 to 0, 2 to 0))
+
+            assertEquals(2, result.submittedProposalCount)
+            assertEquals(listOf(1, 2, 1), fixture.startedShareDeliveries)
+            assertEquals(listOf(0 to 1, 0 to 2), fixture.builtVoteTargets)
+            assertEquals(2, fixture.submittedBundles.size)
+            assertEquals(listOf(0, 0), fixture.recordedShares)
+            assertEquals(VotingRecoveryPhase.SHARES_SUBMITTED, fixture.recovery.phase)
+            verify(exactly = 1) { fixture.sessionStore.markRoundSubmitted(any(), ROUND_ID, 2) }
+        }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun shareDeliveriesRunTwoAtATime() =
+        runTest {
+            val gates = (1..3).associateWith { CompletableDeferred<Unit>() }
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    proposalCount = 3,
+                    successfulVoteSubmissions = true,
+                    shareDeliveryGates = gates
+                )
+
+            val submission =
+                launch {
+                    fixture.newUseCase(StandardTestDispatcher(testScheduler))(
+                        ROUND_ID,
+                        mapOf(1 to 0, 2 to 0, 3 to 0)
+                    )
+                }
+            advanceUntilIdle()
+
+            // Every question has been cast, yet only two deliveries hold the window.
+            assertEquals(listOf(1, 2), fixture.startedShareDeliveries)
+            assertEquals(2, fixture.maxConcurrentShareDeliveries)
+
+            // The oldest delivery settles, and the queued one takes its permit.
+            gates.getValue(1).complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals(listOf(1, 2, 3), fixture.startedShareDeliveries)
+            assertEquals(2, fixture.maxConcurrentShareDeliveries)
+
+            gates.getValue(2).complete(Unit)
+            gates.getValue(3).complete(Unit)
+            advanceUntilIdle()
+            submission.join()
+
+            assertEquals(listOf(0, 0, 0), fixture.recordedShares)
+        }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun fullShareDeliveryWindowDoesNotStallTheVoteChain() =
+        runTest {
+            val gates = (1..3).associateWith { CompletableDeferred<Unit>() }
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    proposalCount = 3,
+                    successfulVoteSubmissions = true,
+                    shareDeliveryGates = gates
+                )
+
+            val submission =
+                launch {
+                    fixture.newUseCase(StandardTestDispatcher(testScheduler))(
+                        ROUND_ID,
+                        mapOf(1 to 0, 2 to 0, 3 to 0)
+                    )
+                }
+            advanceUntilIdle()
+
+            // The window is full from the second question on, and the third question still proved
+            // and cast its vote rather than waiting for a permit.
+            assertEquals(2, fixture.startedShareDeliveries.size)
+            assertEquals(listOf(1, 2, 3), fixture.builtVoteTargets.map { target -> target.second })
+            assertEquals(listOf(1, 2, 3), fixture.submittedBundles.map { bundle -> bundle.proposalId })
+
+            gates.values.forEach { gate -> gate.complete(Unit) }
+            advanceUntilIdle()
+            submission.join()
+        }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun shareJobsAreJoinedBeforeVotingDbCloses() =
+        runTest {
+            val gate = CompletableDeferred<Unit>()
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    successfulVoteSubmissions = true,
+                    shareDeliveryGate = gate
+                )
+
+            val submission =
+                launch {
+                    fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
+                }
+            advanceUntilIdle()
+
+            assertEquals(1, fixture.submittedBundles.size)
+            assertEquals(0, fixture.closeDbCalls)
+
+            gate.complete(Unit)
+            advanceUntilIdle()
+            submission.join()
+
+            assertEquals(1, fixture.closeDbCalls)
+            assertEquals(listOf(0), fixture.recordedShares)
+        }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun cancellationCancelsInFlightShareJobs() =
+        runTest {
+            val gate = CompletableDeferred<Unit>()
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    successfulVoteSubmissions = true,
+                    shareDeliveryGate = gate
+                )
+
+            val submission =
+                launch {
+                    fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
+                }
+            advanceUntilIdle()
+            assertEquals(0, fixture.closeDbCalls)
+
+            submission.cancel()
+            advanceUntilIdle()
+
+            assertEquals(1, fixture.closeDbCalls)
+            assertEquals(emptyList(), fixture.recordedShares)
+        }
+
     private class CastVoteRecoveryFixture(
         private val selectedAccount: KeystoneAccount,
         private val confirmedChoice: Int = 0,
@@ -481,10 +988,27 @@ class SubmitVotesUseCaseRecoveryTest {
         private val cachedVoteTxHash: String? = null,
         private val successfulVoteSubmissions: Boolean = false,
         private val initialSelections: Map<Int, VotingProposalSelection> = emptyMap(),
-        private val latestNextIndexOverride: Long? = null
+        private val latestNextIndexOverride: Long? = null,
+        private val rejectedConfirmationBundleIndex: Int? = null,
+        var failingShareProposalId: Int? = null,
+        private val shareDeliveryGate: CompletableDeferred<Unit>? = null,
+        private val shareDeliveryGates: Map<Int, CompletableDeferred<Unit>> = emptyMap(),
+        private val proofConcurrencyTarget: Int? = null,
+        private val chainClientFactory: VoteChainClientFactory = VoteChainClientFactory { null }
     ) {
         val crypto = mockk<VotingCryptoClient>(relaxed = true)
         val api = mockk<VotingApiProvider>(relaxed = true)
+        val apiCallLog = mutableListOf<String>()
+        var treeSyncCalls = 0
+        var maxConcurrentProofs = 0
+        var maxConcurrentPosts = 0
+        var maxConcurrentShareDeliveries = 0
+        var perChainClientCalls = 0
+        val startedShareDeliveries = mutableListOf<Int>()
+        private var activeProofs = 0
+        private var activePosts = 0
+        private var activeShareDeliveries = 0
+        private val proofConcurrencyGate = CompletableDeferred<Unit>()
         val submittedBundles = mutableListOf<VoteCommitmentBundle>()
         val submittedSignatures = mutableListOf<CastVoteSignature>()
         val builtVoteTargets = mutableListOf<Pair<Int, Int>>()
@@ -492,8 +1016,10 @@ class SubmitVotesUseCaseRecoveryTest {
         val storedVanPositions = mutableListOf<StoredVanPosition>()
         val recordedVcPositions = mutableListOf<Long>()
         val recordedShares = mutableListOf<Int>()
+        val recordedShareDelegations = mutableListOf<VotingShareDelegationRecord>()
         val confirmationLookups = mutableListOf<String>()
         val persistedVotes = mutableListOf<VotingVoteRecord>()
+        val sessionStore = mockk<VotingSessionStore>(relaxed = true)
         var closeDbCalls = 0
         var latestFetches = 0
         var leafPageFetches = 0
@@ -534,6 +1060,7 @@ class SubmitVotesUseCaseRecoveryTest {
                     eligibleWeight = bundleCount.toLong(),
                     hotkeyAddress = "hotkey"
                 )
+            coEvery { prepareVotingRound.awaitWalletSynced(any()) } returns null
             coEvery { resolveVotingRoundSession(ROUND_ID) } returns
                 VotingRoundSessionContext(
                     session = session,
@@ -579,10 +1106,9 @@ class SubmitVotesUseCaseRecoveryTest {
             coEvery { crypto.openVotingDb(any()) } returns 1
             coEvery { crypto.closeVotingDb(any()) } answers { closeDbCalls += 1 }
             coEvery { crypto.getVotes(any(), any()) } answers { persistedVotes.toList() }
-            coEvery { crypto.getShareDelegations(any(), any()) } returns emptyList()
+            coEvery { crypto.getShareDelegations(any(), any()) } answers { recordedShareDelegations.toList() }
             coEvery { crypto.getVoteTxHash(any(), any(), any(), any()) } returns
                 (cachedVoteTxHash?.let(VotingTxHashLookup::Present) ?: VotingTxHashLookup.NotFound)
-            var treeSyncCalls = 0
             coEvery { crypto.syncVoteTree(any(), any(), any()) } answers {
                 treeSyncCalls += 1
                 if (failFirstTreeSync && treeSyncCalls == 1) -1L else 10L
@@ -604,11 +1130,16 @@ class SubmitVotesUseCaseRecoveryTest {
                     any(),
                     any()
                 )
-            } answers {
+            } coAnswers {
                 val bundleIndex = arg<Int>(2)
                 val proposalId = arg<Int>(4)
                 val choice = arg<Int>(5)
+                activeProofs += 1
+                maxConcurrentProofs = maxOf(maxConcurrentProofs, activeProofs)
                 builtVoteTargets += bundleIndex to proposalId
+                awaitProofConcurrency()
+                yield()
+                activeProofs -= 1
                 persistedVotes.removeAll { vote ->
                     vote.bundleIndex == bundleIndex && vote.proposalId == proposalId
                 }
@@ -619,7 +1150,7 @@ class SubmitVotesUseCaseRecoveryTest {
                         choice = choice,
                         submitted = false
                     )
-                castVoteCommitment(proposalId = proposalId, choice = choice)
+                castVoteCommitment(bundleIndex = bundleIndex, proposalId = proposalId, choice = choice)
             }
             coEvery { crypto.storeVoteTxHash(any(), any(), any(), any(), any()) } answers {
                 val bundleIndex = thirdArg<Int>()
@@ -652,34 +1183,47 @@ class SubmitVotesUseCaseRecoveryTest {
             coEvery { crypto.scheduledShareSubmitAt(any(), any(), any(), any()) } returns 0
             coEvery { crypto.recordShareDelegation(any(), any(), any(), any(), any(), any(), any(), any()) } answers {
                 recordedShares += arg<Int>(4)
+                recordedShareDelegations +=
+                    VotingShareDelegationRecord(
+                        roundId = secondArg(),
+                        bundleIndex = thirdArg(),
+                        proposalId = arg(3),
+                        shareIndex = arg(4),
+                        sentToUrls = arg(5),
+                        nullifier = arg(6),
+                        confirmed = false,
+                        submitAt = arg(7),
+                        createdAt = 0
+                    )
             }
 
-            coEvery { api.submitVoteCommitment(any(), any()) } answers {
-                submittedBundles += firstArg<VoteCommitmentBundle>()
-                submittedSignatures += secondArg<CastVoteSignature>()
-                if (successfulVoteSubmissions) {
-                    val (bundleIndex, proposalId) = builtVoteTargets.last()
-                    return@answers TxResult(
-                        txHash = "accepted-$bundleIndex-$proposalId",
-                        code = 0
-                    )
-                }
-                submissionAttempt += 1
-                if (submissionAttempt == 1) {
-                    throw CastVoteResponseLost()
-                }
-                TxResult(
-                    txHash = ORIGINAL_CAST_TX_HASH,
-                    code = 2,
-                    log = "nullifier already spent"
-                )
+            coEvery { api.submitVoteCommitment(any(), any()) } coAnswers {
+                postVoteCommitment(firstArg(), secondArg())
+            }
+            coEvery { api.submitVoteCommitment(any(), any(), any()) } coAnswers {
+                perChainClientCalls += 1
+                postVoteCommitment(firstArg(), secondArg())
             }
             coEvery { api.fetchTxConfirmation(ORIGINAL_CAST_TX_HASH) } answers {
                 confirmationLookups += ORIGINAL_CAST_TX_HASH
                 castVoteConfirmation()
             }
-            coEvery { api.fetchTxConfirmation(match { txHash -> txHash.startsWith("accepted-") }) } returns
-                castVoteConfirmation()
+            coEvery {
+                api.fetchTxConfirmation(match { txHash -> txHash.startsWith("accepted-") }, any<String>(), any())
+            } answers {
+                confirmVoteCommitment(firstArg())
+            }
+            coEvery {
+                api.fetchTxConfirmation(
+                    match { txHash -> txHash.startsWith("accepted-") },
+                    any<HttpClient>(),
+                    any(),
+                    any()
+                )
+            } answers {
+                perChainClientCalls += 1
+                confirmVoteCommitment(firstArg())
+            }
             val confirmedCommitment = castVoteCommitment(proposalId = 1, choice = confirmedChoice)
             val confirmedLeaves =
                 MutableList(13) { ByteArray(32) }.also { leaves ->
@@ -704,8 +1248,18 @@ class SubmitVotesUseCaseRecoveryTest {
                     nextFromHeight = 0
                 )
             }
-            coEvery { api.delegateShares(any()) } answers {
+            coEvery { api.delegateShares(any()) } coAnswers {
                 val proposalId = firstArg<List<SharePayload>>().single().proposalId
+                startedShareDeliveries += proposalId
+                activeShareDeliveries += 1
+                maxConcurrentShareDeliveries = maxOf(maxConcurrentShareDeliveries, activeShareDeliveries)
+                try {
+                    shareDeliveryGate?.await()
+                    shareDeliveryGates[proposalId]?.await()
+                } finally {
+                    activeShareDeliveries -= 1
+                }
+                check(proposalId != failingShareProposalId) { "share helper unavailable" }
                 listOf(
                     DelegatedShareInfo(
                         shareIndex = 0,
@@ -716,11 +1270,61 @@ class SubmitVotesUseCaseRecoveryTest {
             }
         }
 
-        fun newUseCase() =
+        /**
+         * Holds every proof inside the fake until [proofConcurrencyTarget] of them are in flight,
+         * so a regression that serializes proving again fails on the timeout instead of hanging.
+         */
+        private suspend fun awaitProofConcurrency() {
+            val target = proofConcurrencyTarget ?: return
+            if (activeProofs >= target) {
+                proofConcurrencyGate.complete(Unit)
+            }
+            withTimeout(PROOF_CONCURRENCY_TIMEOUT_MS) { proofConcurrencyGate.await() }
+        }
+
+        private suspend fun postVoteCommitment(
+            bundle: VoteCommitmentBundle,
+            signature: CastVoteSignature
+        ): TxResult {
+            submittedBundles += bundle
+            submittedSignatures += signature
+            val bundleIndex = signature.voteAuthSig[1].toInt()
+            val proposalId = signature.voteAuthSig[2].toInt()
+            activePosts += 1
+            maxConcurrentPosts = maxOf(maxConcurrentPosts, activePosts)
+            apiCallLog += "post:$bundleIndex"
+            yield()
+            activePosts -= 1
+            if (successfulVoteSubmissions) {
+                return TxResult(txHash = "accepted-$bundleIndex-$proposalId", code = 0)
+            }
+            submissionAttempt += 1
+            if (submissionAttempt == 1) {
+                throw CastVoteResponseLost()
+            }
+            return TxResult(
+                txHash = ORIGINAL_CAST_TX_HASH,
+                code = 2,
+                log = "nullifier already spent"
+            )
+        }
+
+        private fun confirmVoteCommitment(txHash: String): TxConfirmation {
+            apiCallLog += "confirm:$txHash"
+            return if (rejectedConfirmationBundleIndex != null &&
+                txHash.startsWith("accepted-$rejectedConfirmationBundleIndex-")
+            ) {
+                TxConfirmation(height = 20, code = 4, log = "vote commitment rejected")
+            } else {
+                castVoteConfirmation()
+            }
+        }
+
+        fun newUseCase(ioDispatcher: CoroutineDispatcher = Dispatchers.IO) =
             SubmitVotesUseCase(
                 resolveVotingRoundSession = resolveVotingRoundSession,
                 votingRecoveryRepository = recoveryRepository,
-                votingSessionStore = mockk<VotingSessionStore>(relaxed = true),
+                votingSessionStore = sessionStore,
                 votingCryptoClient = crypto,
                 votingProofPrecomputeRepository = mockk<VotingProofPrecomputeRepository>(relaxed = true),
                 votingApiProvider = api,
@@ -730,18 +1334,35 @@ class SubmitVotesUseCaseRecoveryTest {
                 getSelectedWalletAccount = getSelectedWalletAccount,
                 getWalletSeedBytes = mockk(relaxed = true),
                 prepareVotingRound = prepareVotingRound,
-                votingShareTrackingScheduler = mockk<VotingShareTrackingScheduler>(relaxed = true)
+                votingShareTrackingScheduler = mockk<VotingShareTrackingScheduler>(relaxed = true),
+                ioDispatcher = ioDispatcher,
+                chainClientFactory = chainClientFactory
             )
     }
 
     private class RecoveryFixture(
         private val selectedAccount: KeystoneAccount,
-        private val bundle0Failure: Exception? = null
+        private val bundle0Failure: Exception? = null,
+        private val successfulDelegations: Boolean = false,
+        private val acceptingServerUrl: String? = null,
+        private val notIndexedConfirmationAttempts: Int = 0,
+        private val preferredServerNeverIndexes: Boolean = false,
+        private val proofConcurrencyTarget: Int? = null,
+        initialDelegationPhase: DelegationPhase = DelegationPhase.PROVED
     ) {
         val crypto = mockk<VotingCryptoClient>(relaxed = true)
         val api = mockk<VotingApiProvider>(relaxed = true)
-        val delegationPhases = mutableListOf(DelegationPhase.PROVED, DelegationPhase.PROVED)
+        val apiCallLog = mutableListOf<String>()
+        val confirmationCalls = mutableListOf<ConfirmationCall>()
+        private val confirmationLock = Any()
+        private val confirmationAttempts = mutableMapOf<String, Int>()
+        val delegationPhases = mutableListOf(initialDelegationPhase, initialDelegationPhase)
         val submissionCounts = mutableMapOf(0 to 0, 1 to 0)
+        var maxConcurrentDelegationProofs = 0
+        var maxConcurrentDelegationPosts = 0
+        private var activeDelegationProofs = 0
+        private var activeDelegationPosts = 0
+        private val proofConcurrencyGate = CompletableDeferred<Unit>()
         val storedVanPositions = mutableListOf<StoredVanPosition>()
         val storedDelegationHashes = mutableListOf<String>()
         val requestedLeafRanges = mutableListOf<LongRange>()
@@ -786,6 +1407,7 @@ class SubmitVotesUseCaseRecoveryTest {
             coEvery { getSelectedWalletAccount() } returns selectedAccount
             coEvery { prepareVotingRound(ROUND_ID) } returns
                 VotingRoundPreparationResult.Ready(ROUND_ID, 2, 2, "hotkey")
+            coEvery { prepareVotingRound.awaitWalletSynced(any()) } returns null
             coEvery { resolveVotingRoundSession(ROUND_ID) } returns
                 VotingRoundSessionContext(
                     session = session,
@@ -803,6 +1425,7 @@ class SubmitVotesUseCaseRecoveryTest {
             }
             coEvery { hotkeySeedProvider.get(accountUuid) } returns ByteArray(32) { 9 }
             coEvery { proofPrecomputeRepository.awaitDelegationPirPrecompute(any()) } returns null
+            coEvery { proofPrecomputeRepository.awaitDelegationProof(any()) } returns null
 
             coEvery { crypto.getWalletNotesJson(any(), any(), any(), any()) } returns "[]"
             coEvery { crypto.openVotingDb(any()) } returns 1
@@ -814,6 +1437,32 @@ class SubmitVotesUseCaseRecoveryTest {
                 delegationPhases.mapIndexed { index, phase -> BundleDelegationPhase(index, phase) }
             }
             coEvery { crypto.generateNoteWitnessesJson(any(), any(), any(), any(), any(), any()) } returns "{}"
+            coEvery { crypto.extractOrchardFvkFromUfvk(any(), any()) } returns ByteArray(32)
+            coEvery {
+                crypto.buildAndProveDelegation(
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any(),
+                    any()
+                )
+            } coAnswers {
+                val bundleIndex = arg<Int>(2)
+                activeDelegationProofs += 1
+                maxConcurrentDelegationProofs = maxOf(maxConcurrentDelegationProofs, activeDelegationProofs)
+                awaitProofConcurrency()
+                yield()
+                activeDelegationProofs -= 1
+                delegationPhases[bundleIndex] = DelegationPhase.PROVED
+                mockk(relaxed = true)
+            }
             coEvery {
                 crypto.getDelegationSubmissionWithKeystoneSignature(any(), any(), any(), any(), any())
             } answers {
@@ -831,7 +1480,7 @@ class SubmitVotesUseCaseRecoveryTest {
             }
             coEvery { crypto.syncVoteTree(any(), any(), any()) } throws ContinuationReached()
 
-            coEvery { api.submitDelegation(any()) } answers {
+            coEvery { api.submitDelegation(any()) } coAnswers {
                 val bundleIndex =
                     if (firstArg<DelegationRegistration>().vanCmx[0] == 1.toByte()) {
                         0
@@ -839,7 +1488,20 @@ class SubmitVotesUseCaseRecoveryTest {
                         1
                     }
                 submissionCounts[bundleIndex] = submissionCounts.getValue(bundleIndex) + 1
+                apiCallLog += "post:$bundleIndex"
+                activeDelegationPosts += 1
+                maxConcurrentDelegationPosts = maxOf(maxConcurrentDelegationPosts, activeDelegationPosts)
+                yield()
+                activeDelegationPosts -= 1
                 when {
+                    successfulDelegations -> {
+                        TxResult(
+                            txHash = "bundle-$bundleIndex-tx",
+                            code = 0,
+                            acceptedByServerUrl = acceptingServerUrl
+                        )
+                    }
+
                     bundleIndex == 0 && bundle0Failure != null -> {
                         throw bundle0Failure
                     }
@@ -857,18 +1519,43 @@ class SubmitVotesUseCaseRecoveryTest {
                     }
                 }
             }
-            coEvery { api.fetchTxConfirmation("bundle-1-tx") } returns
-                TxConfirmation(
-                    height = 20,
-                    code = 0,
-                    events =
-                        listOf(
-                            TxEvent(
-                                type = "delegate_vote",
-                                attributes = listOf(TxEventAttribute("leaf_index", "3"))
+            coEvery {
+                api.fetchTxConfirmation(match { txHash -> txHash.startsWith("bundle-") }, any<String>(), any())
+            } answers {
+                val txHash = firstArg<String>()
+                val preferredServerUrl = secondArg<String?>()
+                val consultOthers = thirdArg<Boolean>()
+                // Both bundle chains answer here at once, so the bookkeeping needs its own lock.
+                val attempt =
+                    synchronized(confirmationLock) {
+                        apiCallLog += "confirm:$txHash"
+                        confirmationCalls += ConfirmationCall(txHash, preferredServerUrl, consultOthers)
+                        val next = confirmationAttempts.getOrDefault(txHash, 0) + 1
+                        confirmationAttempts[txHash] = next
+                        next
+                    }
+                val indexed =
+                    if (preferredServerNeverIndexes) {
+                        consultOthers
+                    } else {
+                        attempt > notIndexedConfirmationAttempts
+                    }
+                if (!indexed) {
+                    null
+                } else {
+                    TxConfirmation(
+                        height = 20,
+                        code = 0,
+                        events =
+                            listOf(
+                                TxEvent(
+                                    type = "delegate_vote",
+                                    attributes = listOf(TxEventAttribute("leaf_index", "3"))
+                                )
                             )
-                        )
-                )
+                    )
+                }
+            }
             coEvery { api.fetchCommitmentTreeLatest(ROUND_ID) } returns CommitmentTreeLatest(20, 2)
             coEvery { api.fetchCommitmentTreeLeafPage(ROUND_ID, any(), 20) } answers {
                 val fromHeight = secondArg<Long>()
@@ -909,7 +1596,20 @@ class SubmitVotesUseCaseRecoveryTest {
             }
         }
 
-        fun newUseCase() =
+        /**
+         * Holds every delegation proof inside the fake until [proofConcurrencyTarget] of them are
+         * in flight, so a regression that serializes proving again fails on the timeout instead of
+         * hanging.
+         */
+        private suspend fun awaitProofConcurrency() {
+            val target = proofConcurrencyTarget ?: return
+            if (activeDelegationProofs >= target) {
+                proofConcurrencyGate.complete(Unit)
+            }
+            withTimeout(PROOF_CONCURRENCY_TIMEOUT_MS) { proofConcurrencyGate.await() }
+        }
+
+        fun newUseCase(ioDispatcher: CoroutineDispatcher = Dispatchers.IO) =
             SubmitVotesUseCase(
                 resolveVotingRoundSession = resolveVotingRoundSession,
                 votingRecoveryRepository = recoveryRepository,
@@ -923,13 +1623,20 @@ class SubmitVotesUseCaseRecoveryTest {
                 getSelectedWalletAccount = getSelectedWalletAccount,
                 getWalletSeedBytes = mockk(relaxed = true),
                 prepareVotingRound = prepareVotingRound,
-                votingShareTrackingScheduler = mockk<VotingShareTrackingScheduler>(relaxed = true)
+                votingShareTrackingScheduler = mockk<VotingShareTrackingScheduler>(relaxed = true),
+                ioDispatcher = ioDispatcher
             )
     }
 
     private data class StoredVanPosition(
         val bundleIndex: Int,
         val position: Int
+    )
+
+    private data class ConfirmationCall(
+        val txHash: String,
+        val preferredServerUrl: String?,
+        val consultOthers: Boolean
     )
 
     private class FirstRunInterrupted : CancellationException()
@@ -940,7 +1647,9 @@ class SubmitVotesUseCaseRecoveryTest {
 
     private companion object {
         const val ROUND_ID = "1111111111111111111111111111111111111111111111111111111111111111"
+        const val PROOF_CONCURRENCY_TIMEOUT_MS = 10_000L
         const val ORIGINAL_CAST_TX_HASH = "original-cast-tx"
+        const val ACCEPTING_SERVER_URL = "https://vote"
         val SPEND_AUTH_SIG = byteArrayOf(2)
         val SIGHASH = byteArrayOf(3)
         val RK = byteArrayOf(4)
@@ -963,6 +1672,7 @@ class SubmitVotesUseCaseRecoveryTest {
             )
 
         fun castVoteCommitment(
+            bundleIndex: Int = 0,
             proposalId: Int,
             choice: Int
         ): VotingVoteCommitment {
@@ -982,7 +1692,12 @@ class SubmitVotesUseCaseRecoveryTest {
                 voteAuthorityNoteNew = voteAuthorityNoteNew,
                 voteCommitment = voteCommitment,
                 rVpk = byteArrayOf(4),
-                voteAuthSig = byteArrayOf((0x50 + proposalId + choice).toByte()),
+                voteAuthSig =
+                    byteArrayOf(
+                        (0x50 + proposalId + choice).toByte(),
+                        bundleIndex.toByte(),
+                        proposalId.toByte()
+                    ),
                 anchorHeight = 10,
                 encSharesJson = """[{"c1":"06","c2":"07","share_index":0}]""",
                 rawBundleJson =
