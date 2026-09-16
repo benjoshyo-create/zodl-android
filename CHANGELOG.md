@@ -12,6 +12,11 @@ and this application adheres to [Semantic Versioning](https://semver.org/spec/v2
 - Bitcoin, Litecoin, EIP-681 and Solana payment URIs are parsed through the SDK and routed into asset selection,
   Pay and Swap; unsupported schemes, Solana transaction requests and unknown assets are rejected (MOB-1751).
 
+### Changed:
+
+- The sub-$300 refund warning and the Swap explainer now name a wrong asset, rather than a wrong address, as
+  the mistake NEAR does not refund, matching the updated design (MOB-1890).
+
 ## [3.13.0 (2705)] - 2026-09-15
 
 ### Added:
