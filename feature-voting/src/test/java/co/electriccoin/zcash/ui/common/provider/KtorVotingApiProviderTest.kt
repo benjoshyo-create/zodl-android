@@ -514,6 +514,41 @@ class KtorVotingApiProviderTest {
             assertEquals(listOf("vote-b.example.com"), confirmationHosts)
         }
 
+    /**
+     * The accepting server's indexer may be the stuck one, so its 404 no longer ends the walk and
+     * the sibling's confirmation is taken instead.
+     */
+    @Test
+    fun consultingTheOtherServersLooksPastTheAcceptingServersNotIndexedAnswer() =
+        runBlocking {
+            val confirmationHosts = mutableListOf<String>()
+            val provider =
+                KtorVotingApiProvider(
+                    httpClientProvider =
+                        object : HttpClientProvider {
+                            override suspend fun supportsKtorTimeouts(): Boolean = true
+
+                            override suspend fun createTor(): HttpClient = create()
+
+                            override suspend fun create(): HttpClient =
+                                twoVoteServerClient(confirmationHosts, HttpStatusCode.NotFound)
+                        },
+                    configurationRepository = TestConfigurationRepository(),
+                    votingChainConfigRepository = TestVotingChainConfigRepository(),
+                    votingCryptoClient = unusedVotingCryptoClient()
+                )
+
+            val confirmation =
+                provider.fetchTxConfirmation(
+                    "tx-hash",
+                    preferredServerUrl = SECOND_VOTE_SERVER_URL,
+                    consultOthers = true
+                )
+
+            assertEquals(42L, confirmation?.height)
+            assertEquals(listOf("vote-b.example.com", "vote-a.example.com"), confirmationHosts)
+        }
+
     @Test
     fun anUnreachableAcceptingServerStillFallsBackToTheOtherVoteServers() =
         runBlocking {

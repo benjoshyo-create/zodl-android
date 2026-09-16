@@ -154,17 +154,22 @@ interface VotingApiProvider {
      * accepted the broadcast is the one that indexes it first, and a 404 from it means the
      * transaction is simply not mined yet, so the remaining servers are not asked. Only a server
      * that cannot answer at all falls through to the rest.
+     *
+     * [consultOthers] asks the other vote servers even for that 404, for the case the preferred
+     * server's own indexer is lagging or was restarted and will never answer for this transaction.
      */
     suspend fun fetchTxConfirmation(
         txHash: String,
-        preferredServerUrl: String? = null
+        preferredServerUrl: String? = null,
+        consultOthers: Boolean = false
     ): TxConfirmation?
 
     /** Per-chain variant of [fetchTxConfirmation]; see [submitDelegation]. */
     suspend fun fetchTxConfirmation(
         txHash: String,
         client: HttpClient,
-        preferredServerUrl: String? = null
+        preferredServerUrl: String? = null,
+        consultOthers: Boolean = false
     ): TxConfirmation?
 
     suspend fun fetchCommitmentTreeLatest(roundIdHex: String): CommitmentTreeLatest
@@ -569,23 +574,31 @@ class KtorVotingApiProvider(
 
     override suspend fun fetchTxConfirmation(
         txHash: String,
-        preferredServerUrl: String?
+        preferredServerUrl: String?,
+        consultOthers: Boolean
     ): TxConfirmation? {
         val serverUrls = configuredVoteServerUrls()
         return executeWithKtorTimeoutSupport { supportsKtorTimeouts ->
-            fetchTxConfirmationFrom(serverUrls, txHash, preferredServerUrl, supportsKtorTimeouts)
+            fetchTxConfirmationFrom(serverUrls, txHash, preferredServerUrl, consultOthers, supportsKtorTimeouts)
         }
     }
 
     override suspend fun fetchTxConfirmation(
         txHash: String,
         client: HttpClient,
-        preferredServerUrl: String?
+        preferredServerUrl: String?,
+        consultOthers: Boolean
     ): TxConfirmation? {
         val serverUrls = configuredVoteServerUrls()
         val supportsKtorTimeouts = httpClientProvider.supportsKtorTimeouts()
         return withContext(Dispatchers.IO) {
-            client.fetchTxConfirmationFrom(serverUrls, txHash, preferredServerUrl, supportsKtorTimeouts)
+            client.fetchTxConfirmationFrom(
+                serverUrls,
+                txHash,
+                preferredServerUrl,
+                consultOthers,
+                supportsKtorTimeouts
+            )
         }
     }
 
@@ -594,20 +607,24 @@ class KtorVotingApiProvider(
      * other server does, so its [TxConfirmationLookup.NotIndexed] is the authoritative "not mined
      * yet" and there is nothing to gain from asking the rest - only a server that cannot answer at
      * all falls through to them.
+     *
+     * [consultOthers] walks the rest even then, which is how a caller that keeps getting the same
+     * 404 finds out whether the accepting server's indexer is the one that is stuck.
      */
     private suspend fun HttpClient.fetchTxConfirmationFrom(
         serverUrls: List<String>,
         txHash: String,
         preferredServerUrl: String?,
+        consultOthers: Boolean,
         supportsKtorTimeouts: Boolean
     ): TxConfirmation? {
         val preferred =
             preferredServerUrl?.let { serverUrl ->
                 fetchTxConfirmationFromServer(serverUrl, txHash, supportsKtorTimeouts)
             }
-        return when (preferred) {
-            is TxConfirmationLookup.Confirmed -> preferred.confirmation
-            TxConfirmationLookup.NotIndexed -> null
+        return when {
+            preferred is TxConfirmationLookup.Confirmed -> preferred.confirmation
+            preferred == TxConfirmationLookup.NotIndexed && !consultOthers -> null
             else -> fetchTxConfirmationWalking(serverUrls, txHash, preferredServerUrl, supportsKtorTimeouts)
         }
     }

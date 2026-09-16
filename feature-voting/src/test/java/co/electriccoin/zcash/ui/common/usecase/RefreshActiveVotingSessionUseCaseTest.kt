@@ -114,13 +114,15 @@ class RefreshActiveVotingSessionUseCaseTest {
 
         override suspend fun fetchTxConfirmation(
             txHash: String,
-            preferredServerUrl: String?
+            preferredServerUrl: String?,
+            consultOthers: Boolean
         ): TxConfirmation? = error("unused")
 
         override suspend fun fetchTxConfirmation(
             txHash: String,
             client: HttpClient,
-            preferredServerUrl: String?
+            preferredServerUrl: String?,
+            consultOthers: Boolean
         ): TxConfirmation? = error("unused")
 
         override suspend fun fetchCommitmentTreeLatest(roundIdHex: String): CommitmentTreeLatest =

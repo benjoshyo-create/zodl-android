@@ -760,6 +760,34 @@ class SubmitVotesUseCaseRecoveryTest {
             )
         }
 
+    /**
+     * The accepting server's indexer never answers for this transaction, so the poll that finally
+     * confirms it is the one that asks the other vote servers as well.
+     */
+    @Test
+    fun confirmationPollsConsultTheOtherVoteServersEveryEighthAttempt() =
+        runTest {
+            val fixture =
+                RecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    successfulDelegations = true,
+                    acceptingServerUrl = ACCEPTING_SERVER_URL,
+                    preferredServerNeverIndexes = true
+                )
+
+            assertFailsWith<ContinuationReached> {
+                fixture.newUseCase(StandardTestDispatcher(testScheduler))(ROUND_ID, mapOf(1 to 0))
+            }
+
+            val bundleCalls = fixture.confirmationCalls.filter { call -> call.txHash == "bundle-0-tx" }
+            assertEquals(8, bundleCalls.size)
+            assertEquals(List(7) { false } + true, bundleCalls.map { call -> call.consultOthers })
+            assertEquals(
+                listOf(ACCEPTING_SERVER_URL),
+                bundleCalls.map { call -> call.preferredServerUrl }.distinct()
+            )
+        }
+
     @Test
     fun shareDeliveryFailureDoesNotBlockNextQuestion() =
         runTest {
@@ -1180,11 +1208,18 @@ class SubmitVotesUseCaseRecoveryTest {
                 confirmationLookups += ORIGINAL_CAST_TX_HASH
                 castVoteConfirmation()
             }
-            coEvery { api.fetchTxConfirmation(match { txHash -> txHash.startsWith("accepted-") }) } answers {
+            coEvery {
+                api.fetchTxConfirmation(match { txHash -> txHash.startsWith("accepted-") }, any<String>(), any())
+            } answers {
                 confirmVoteCommitment(firstArg())
             }
             coEvery {
-                api.fetchTxConfirmation(match { txHash -> txHash.startsWith("accepted-") }, any<HttpClient>())
+                api.fetchTxConfirmation(
+                    match { txHash -> txHash.startsWith("accepted-") },
+                    any<HttpClient>(),
+                    any(),
+                    any()
+                )
             } answers {
                 perChainClientCalls += 1
                 confirmVoteCommitment(firstArg())
@@ -1311,6 +1346,7 @@ class SubmitVotesUseCaseRecoveryTest {
         private val successfulDelegations: Boolean = false,
         private val acceptingServerUrl: String? = null,
         private val notIndexedConfirmationAttempts: Int = 0,
+        private val preferredServerNeverIndexes: Boolean = false,
         private val proofConcurrencyTarget: Int? = null,
         initialDelegationPhase: DelegationPhase = DelegationPhase.PROVED
     ) {
@@ -1484,20 +1520,27 @@ class SubmitVotesUseCaseRecoveryTest {
                 }
             }
             coEvery {
-                api.fetchTxConfirmation(match { txHash -> txHash.startsWith("bundle-") }, any<String>())
+                api.fetchTxConfirmation(match { txHash -> txHash.startsWith("bundle-") }, any<String>(), any())
             } answers {
                 val txHash = firstArg<String>()
                 val preferredServerUrl = secondArg<String?>()
+                val consultOthers = thirdArg<Boolean>()
                 // Both bundle chains answer here at once, so the bookkeeping needs its own lock.
                 val attempt =
                     synchronized(confirmationLock) {
                         apiCallLog += "confirm:$txHash"
-                        confirmationCalls += ConfirmationCall(txHash, preferredServerUrl)
+                        confirmationCalls += ConfirmationCall(txHash, preferredServerUrl, consultOthers)
                         val next = confirmationAttempts.getOrDefault(txHash, 0) + 1
                         confirmationAttempts[txHash] = next
                         next
                     }
-                if (attempt <= notIndexedConfirmationAttempts) {
+                val indexed =
+                    if (preferredServerNeverIndexes) {
+                        consultOthers
+                    } else {
+                        attempt > notIndexedConfirmationAttempts
+                    }
+                if (!indexed) {
                     null
                 } else {
                     TxConfirmation(
@@ -1592,7 +1635,8 @@ class SubmitVotesUseCaseRecoveryTest {
 
     private data class ConfirmationCall(
         val txHash: String,
-        val preferredServerUrl: String?
+        val preferredServerUrl: String?,
+        val consultOthers: Boolean
     )
 
     private class FirstRunInterrupted : CancellationException()

@@ -1821,7 +1821,9 @@ class SubmitVotesUseCase(
      *
      * [preferredServerUrl] is the server that accepted the broadcast; a fresh-submit wait polls it
      * rather than walking every server on every attempt. The probes pass null - they have no
-     * accepting server, only a hash from a previous run.
+     * accepting server, only a hash from a previous run. Every [CONFIRMATION_FALLBACK_EVERY]th
+     * attempt consults the other servers too, so an indexer that is stuck on the accepting server
+     * costs a handful of polls rather than the whole budget.
      *
      * Returns null when the TX is not seen within the budget; callers decide whether that is
      * fatal (fresh-submit) or a fall-through signal (recovery).
@@ -1840,7 +1842,8 @@ class SubmitVotesUseCase(
         Log.i(TAG, "Voting trace begin awaitTxConfirmation $traceContext")
         val startedAt = SystemClock.elapsedRealtime()
         repeat(maxAttempts) { attempt ->
-            session.fetchTxConfirmation(txHash, preferredServerUrl)?.let { confirmation ->
+            val consultOthers = (attempt + 1) % CONFIRMATION_FALLBACK_EVERY == 0
+            session.fetchTxConfirmation(txHash, preferredServerUrl, consultOthers)?.let { confirmation ->
                 logAwaitTxConfirmationEnd(traceContext, startedAt, attempt + 1)
                 return confirmation
             }
@@ -2282,12 +2285,13 @@ class SubmitVotesUseCase(
 
         suspend fun fetchTxConfirmation(
             txHash: String,
-            preferredServerUrl: String? = null
+            preferredServerUrl: String? = null,
+            consultOthers: Boolean = false
         ): TxConfirmation? =
             if (client == null) {
-                votingApiProvider.fetchTxConfirmation(txHash, preferredServerUrl)
+                votingApiProvider.fetchTxConfirmation(txHash, preferredServerUrl, consultOthers)
             } else {
-                votingApiProvider.fetchTxConfirmation(txHash, client, preferredServerUrl)
+                votingApiProvider.fetchTxConfirmation(txHash, client, preferredServerUrl, consultOthers)
             }
 
         override fun close() {
@@ -2326,6 +2330,13 @@ class SubmitVotesUseCase(
          * circuits and keeps circuits free for the chain clients' confirmation polls.
          */
         const val MAX_IN_FLIGHT_SHARE_DELIVERIES = 2
+
+        /**
+         * How often a confirmation poll also asks the other vote servers: the accepting server
+         * indexes first, but a lagging or restarted indexer there must not cost the whole budget,
+         * and at this rate a stuck one is worked around roughly every six seconds.
+         */
+        const val CONFIRMATION_FALLBACK_EVERY = 8
         const val TX_CONFIRMATION_RETRIES = 120
         const val TX_CONFIRMATION_POLL_MS = 750L
         const val SHARE_DELEGATION_ATTEMPTS = 3
