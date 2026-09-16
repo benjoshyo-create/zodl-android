@@ -31,6 +31,7 @@ import co.electriccoin.zcash.ui.common.model.voting.VotingPirLayout
 import co.electriccoin.zcash.ui.common.model.voting.VotingRoundPreparationResult
 import co.electriccoin.zcash.ui.common.model.voting.VotingServiceConfig
 import co.electriccoin.zcash.ui.common.model.voting.VotingSession
+import co.electriccoin.zcash.ui.common.model.voting.VotingShareDelegationRecord
 import co.electriccoin.zcash.ui.common.model.voting.VotingSubmissionRecoverableException
 import co.electriccoin.zcash.ui.common.model.voting.VotingTxHashLookup
 import co.electriccoin.zcash.ui.common.model.voting.VotingVoteCommitment
@@ -56,6 +57,7 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.verify
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -785,6 +787,41 @@ class SubmitVotesUseCaseRecoveryTest {
             assertEquals(VotingRecoveryPhase.VOTES_SUBMITTED, fixture.recovery.phase)
         }
 
+    /**
+     * Every vote of the failed run is already on chain, so the retry casts nothing and only
+     * resends the shares of the question whose delivery failed.
+     */
+    @Test
+    fun retryResendsOnlyTheHelperSharesThatNeverLanded() =
+        runTest {
+            val fixture =
+                CastVoteRecoveryFixture(
+                    selectedAccount = keystoneAccount(),
+                    proposalCount = 2,
+                    successfulVoteSubmissions = true,
+                    failingShareProposalId = 1
+                )
+
+            assertFailsWith<VotingShareDeliveryException> {
+                fixture.newUseCase()(ROUND_ID, mapOf(1 to 0, 2 to 0))
+            }
+
+            assertEquals(VotingRecoveryPhase.VOTES_SUBMITTED, fixture.recovery.phase)
+            assertEquals(listOf(1, 2), fixture.startedShareDeliveries)
+            assertEquals(listOf(0), fixture.recordedShares)
+
+            fixture.failingShareProposalId = null
+            val result = fixture.newUseCase()(ROUND_ID, mapOf(1 to 0, 2 to 0))
+
+            assertEquals(2, result.submittedProposalCount)
+            assertEquals(listOf(1, 2, 1), fixture.startedShareDeliveries)
+            assertEquals(listOf(0 to 1, 0 to 2), fixture.builtVoteTargets)
+            assertEquals(2, fixture.submittedBundles.size)
+            assertEquals(listOf(0, 0), fixture.recordedShares)
+            assertEquals(VotingRecoveryPhase.SHARES_SUBMITTED, fixture.recovery.phase)
+            verify(exactly = 1) { fixture.sessionStore.markRoundSubmitted(any(), ROUND_ID, 2) }
+        }
+
     @Test
     @OptIn(ExperimentalCoroutinesApi::class)
     fun shareDeliveriesRunTwoAtATime() =
@@ -925,7 +962,7 @@ class SubmitVotesUseCaseRecoveryTest {
         private val initialSelections: Map<Int, VotingProposalSelection> = emptyMap(),
         private val latestNextIndexOverride: Long? = null,
         private val rejectedConfirmationBundleIndex: Int? = null,
-        private val failingShareProposalId: Int? = null,
+        var failingShareProposalId: Int? = null,
         private val shareDeliveryGate: CompletableDeferred<Unit>? = null,
         private val shareDeliveryGates: Map<Int, CompletableDeferred<Unit>> = emptyMap(),
         private val proofConcurrencyTarget: Int? = null,
@@ -951,8 +988,10 @@ class SubmitVotesUseCaseRecoveryTest {
         val storedVanPositions = mutableListOf<StoredVanPosition>()
         val recordedVcPositions = mutableListOf<Long>()
         val recordedShares = mutableListOf<Int>()
+        val recordedShareDelegations = mutableListOf<VotingShareDelegationRecord>()
         val confirmationLookups = mutableListOf<String>()
         val persistedVotes = mutableListOf<VotingVoteRecord>()
+        val sessionStore = mockk<VotingSessionStore>(relaxed = true)
         var closeDbCalls = 0
         var latestFetches = 0
         var leafPageFetches = 0
@@ -1038,7 +1077,7 @@ class SubmitVotesUseCaseRecoveryTest {
             coEvery { crypto.openVotingDb(any()) } returns 1
             coEvery { crypto.closeVotingDb(any()) } answers { closeDbCalls += 1 }
             coEvery { crypto.getVotes(any(), any()) } answers { persistedVotes.toList() }
-            coEvery { crypto.getShareDelegations(any(), any()) } returns emptyList()
+            coEvery { crypto.getShareDelegations(any(), any()) } answers { recordedShareDelegations.toList() }
             coEvery { crypto.getVoteTxHash(any(), any(), any(), any()) } returns
                 (cachedVoteTxHash?.let(VotingTxHashLookup::Present) ?: VotingTxHashLookup.NotFound)
             coEvery { crypto.syncVoteTree(any(), any(), any()) } answers {
@@ -1115,6 +1154,18 @@ class SubmitVotesUseCaseRecoveryTest {
             coEvery { crypto.scheduledShareSubmitAt(any(), any(), any(), any()) } returns 0
             coEvery { crypto.recordShareDelegation(any(), any(), any(), any(), any(), any(), any(), any()) } answers {
                 recordedShares += arg<Int>(4)
+                recordedShareDelegations +=
+                    VotingShareDelegationRecord(
+                        roundId = secondArg(),
+                        bundleIndex = thirdArg(),
+                        proposalId = arg(3),
+                        shareIndex = arg(4),
+                        sentToUrls = arg(5),
+                        nullifier = arg(6),
+                        confirmed = false,
+                        submitAt = arg(7),
+                        createdAt = 0
+                    )
             }
 
             coEvery { api.submitVoteCommitment(any(), any()) } coAnswers {
@@ -1237,7 +1288,7 @@ class SubmitVotesUseCaseRecoveryTest {
             SubmitVotesUseCase(
                 resolveVotingRoundSession = resolveVotingRoundSession,
                 votingRecoveryRepository = recoveryRepository,
-                votingSessionStore = mockk<VotingSessionStore>(relaxed = true),
+                votingSessionStore = sessionStore,
                 votingCryptoClient = crypto,
                 votingProofPrecomputeRepository = mockk<VotingProofPrecomputeRepository>(relaxed = true),
                 votingApiProvider = api,

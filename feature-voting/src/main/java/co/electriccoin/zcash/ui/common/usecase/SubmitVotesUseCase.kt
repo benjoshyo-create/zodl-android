@@ -1219,6 +1219,10 @@ class SubmitVotesUseCase(
      * the mempool ordered, and the vote server has no idempotency key to reconcile a reordered
      * pair). Everything else — witnesses, the confirmation wait, share delivery — overlaps, which
      * is where the wall-clock saving comes from.
+     *
+     * A question this bundle already has on chain skips the vote itself but still enters share
+     * delivery: a run that failed while delivering shares left every vote submitted, so the retry
+     * would otherwise never resend the shares that never reached a helper.
      */
     private suspend fun runVoteChains(
         context: VotingSubmitContext,
@@ -1254,6 +1258,14 @@ class SubmitVotesUseCase(
                                         postMutex = postMutex,
                                         coalescer = coalescer,
                                         chainTickets = chainTickets
+                                    )
+                                } else if (bundleIndex in question.submittedBundles) {
+                                    launchShareDelivery(
+                                        context = context,
+                                        dbHandle = dbHandle,
+                                        bundleIndex = bundleIndex,
+                                        proposalId = question.proposalId,
+                                        shareDelivery = shareDelivery
                                     )
                                 }
                                 ledger.update(bundleIndex, questionIndex, CONFIRMED_STAGE)
@@ -2164,8 +2176,9 @@ class SubmitVotesUseCase(
          * The first delivery failure, if any. A share no server accepted was never
          * `recordShareDelegation`-ed, so [co.electriccoin.zcash.ui.common.usecase.TrackVotingSharesUseCase]
          * cannot pick it up later and the submission has to surface it - just once every vote is
-         * safely on chain. A retry re-enters through the cached-vote path and resends only the
-         * share indices that are still missing.
+         * safely on chain. A retry re-enters through the already-submitted path of `runVoteChains`
+         * and resends only the share indices that are still missing, because every proposal of the
+         * failed run is marked submitted and its vote is already on chain.
          */
         fun firstFailure(): Exception? = lock.withLock { failures.firstOrNull() }
 
