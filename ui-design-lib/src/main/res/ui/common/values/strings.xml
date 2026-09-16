@@ -305,10 +305,6 @@
     <string name="error_keystone_firmware_close">Close</string>
     <string name="error_keystone_account_title">Unable to Add Keystone Account</string>
     <string name="error_keystone_account_message">The scanned Keystone account can’t be used with this app. Make sure your Keystone device is set to the same network as this app, then scan the QR code again.</string>
-    <string name="torSetup_alert_title">Disable Tor?</string>
-    <string name="torSetup_alert_msg">Tor connection issues detected. To improve performance, try disabling Tor. This will stop exchange rate updates. You can re-enable it later in Advanced Settings.</string>
-    <string name="torSetup_alert_disable">Disable</string>
-    <string name="torSetup_alert_dontDisable">Don’t disable</string>
 
     <!-- ===== exchange_rate ===== -->
     <string name="currencyConversion_ipTitle">IP Address Protection</string>

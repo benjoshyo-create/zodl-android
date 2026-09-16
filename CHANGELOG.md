@@ -9,6 +9,13 @@ and this application adheres to [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added:
 
+- Bitcoin, Litecoin, EIP-681 and Solana payment URIs are parsed through the SDK and routed into asset selection,
+  Pay and Swap; unsupported schemes, Solana transaction requests and unknown assets are rejected (MOB-1751).
+
+## [3.13.0 (2705)] - 2026-09-15
+
+### Added:
+
 - The support email now includes whether Tor is enabled.
 - Swap and CrossPay now warn you before requesting a quote when the amount you are sending is worth less than
   $300, because NEAR does not refund a swap or payment under $300 that is lost to a wrong address or a wrong
@@ -23,10 +30,20 @@ and this application adheres to [Semantic Versioning](https://semver.org/spec/v2
   iOS (MOB-1890).
 - Currency Conversion now offers every fiat currency supported by the exchange-rate provider except CUP, IRR and RUB. The currency picker loads
   the list on demand and shows a loading state, or an error with retry when the list cannot be fetched.
+- Currency Conversion now reaches the exchange-rate provider over Tor even when Tor is turned off in Settings
+  and Currency Conversion has not been enabled yet, so the currency picker loads its list on first use instead
+  of showing an error.
 
 ### Fixed:
 
 - The seed backup prompt now always takes priority over the migration banner and any sync/connectivity error banner once your wallet has received a balance and you haven't backed up your recovery phrase yet, so it can no longer be hidden behind other home screen messages for days.
+- The loading placeholders on the currency and swap-asset picker sheets are visible again; they used the same
+  colour as the sheet background.
+
+### Removed:
+
+- The "Disable Tor?" dialog for a failed Tor start-up. Tor starts lazily, so the condition it reported could
+  never occur.
 
 ## [3.11.0 (2653)] - 2026-09-08
 
