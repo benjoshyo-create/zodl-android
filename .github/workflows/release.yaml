@@ -288,20 +288,24 @@ jobs:
             --query SecretString --output text)
           echo "::add-mask::${ZONE_ID}"
 
-          PURGE_SUCCESS=$(curl -s -X POST \
-            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/purge_cache" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data '{
-              "files": [
-                "https://foss.zodl.com/fdroid/repo/app-zcashmainnet-foss-release-full-externallibs.apk",
-                "https://foss.zodl.com/fdroid/repo/app-zcashmainnet-foss-release.apk",
-                "https://foss.zodl.com/fdroid/repo/index-v2.json",
-                "https://foss.zodl.com/fdroid/repo/entry.jar"
-              ]
-            }' | jq -r '.success')
-          echo "CF purge result: ${PURGE_SUCCESS}"
+          PURGE_BODY='{"files":["https://foss.zodl.com/fdroid/repo/app-zcashmainnet-foss-release-full-externallibs.apk","https://foss.zodl.com/fdroid/repo/app-zcashmainnet-foss-release.apk","https://foss.zodl.com/fdroid/repo/index-v2.json","https://foss.zodl.com/fdroid/repo/entry.jar"]}'
+
+          for attempt in 1 2 3; do
+            PURGE_RESULT=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/purge_cache" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "${PURGE_BODY}")
+            PURGE_SUCCESS=$(echo "${PURGE_RESULT}" | jq -r '.success')
+            echo "CF purge attempt ${attempt}: ${PURGE_SUCCESS}"
+            if [ "${PURGE_SUCCESS}" = "true" ]; then
+              break
+            fi
+            echo "Response: ${PURGE_RESULT}"
+            [ "${attempt}" -lt 3 ] && sleep 10
+          done
+
           if [ "${PURGE_SUCCESS}" != "true" ]; then
-            echo "::error::Cloudflare cache purge failed"
+            echo "::error::Cloudflare cache purge failed after 3 attempts"
             exit 1
           fi
