@@ -2,91 +2,121 @@ package co.electriccoin.zcash.ui.common.model
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 
 class ZapAttestationMemoTest {
     @Test
-    fun `parses a well formed ZAP1 memo`() {
-        val result = ZapAttestationMemo.parse("ZAP1:AGENT_ACTION:$VALID_HASH")
+    fun `parses the canonical root memo from issue 2172`() {
+        val result = assertNotNull(ZapAttestationMemo.parse("ZAP1:09:$VALID_HASH"))
 
-        assertEquals(ZapAttestationMemo.Protocol.ZAP1, result?.protocol)
-        assertEquals("AGENT_ACTION", result?.eventType)
-        assertEquals(VALID_HASH, result?.leafHash)
+        assertEquals(ZapAttestationMemo.Protocol.ZAP1, result.protocol)
+        assertEquals("09", result.eventType)
+        assertEquals("Merkle root", result.eventLabel)
+        assertEquals(VALID_HASH, result.payloadHash)
     }
 
     @Test
-    fun `parses a legacy NSM1 memo`() {
-        val result = ZapAttestationMemo.parse("NSM1:DEPLOYMENT:$VALID_HASH")
+    fun `parses a legacy NSM1 memo with the same wire format`() {
+        val result = assertNotNull(ZapAttestationMemo.parse("NSM1:04:$VALID_HASH"))
 
-        assertEquals(ZapAttestationMemo.Protocol.NSM1, result?.protocol)
-        assertEquals("DEPLOYMENT", result?.eventType)
+        assertEquals(ZapAttestationMemo.Protocol.NSM1, result.protocol)
+        assertEquals("04", result.eventType)
+        assertEquals("Deployment", result.eventLabel)
+        assertEquals(VALID_HASH, result.payloadHash)
     }
 
     @Test
-    fun `tolerates surrounding whitespace and memo padding`() {
-        val result = ZapAttestationMemo.parse("  ZAP1:MERKLE_ROOT:$VALID_HASH  \n")
+    fun `tolerates surrounding whitespace as specified by the issue parser`() {
+        val result = assertNotNull(ZapAttestationMemo.parse(" \tZAP1:09:$VALID_HASH \r\n"))
 
-        assertEquals("MERKLE_ROOT", result?.eventType)
+        assertEquals("09", result.eventType)
+        assertEquals(VALID_HASH, result.payloadHash)
     }
 
     @Test
-    fun `humanises the event type for display`() {
-        assertEquals(
-            "Governance proposal",
-            ZapAttestationMemo.parse("ZAP1:GOVERNANCE_PROPOSAL:$VALID_HASH")?.eventLabel
-        )
-        assertEquals(
-            "Deployment",
-            ZapAttestationMemo.parse("ZAP1:DEPLOYMENT:$VALID_HASH")?.eventLabel
-        )
+    fun `labels every assigned type in the v3 registry`() {
+        val expected =
+            mapOf(
+                "01" to "Program entry",
+                "02" to "Ownership attestation",
+                "03" to "Contract anchor",
+                "04" to "Deployment",
+                "05" to "Hosting payment",
+                "06" to "Shield renewal",
+                "07" to "Transfer",
+                "08" to "Exit",
+                "09" to "Merkle root",
+                "0a" to "Staking deposit",
+                "0b" to "Staking withdrawal",
+                "0c" to "Staking reward",
+                "0d" to "Governance proposal",
+                "0e" to "Governance vote",
+                "0f" to "Governance result",
+                "40" to "Agent register",
+                "41" to "Agent policy",
+                "42" to "Agent action",
+            )
+
+        for (prefix in listOf("ZAP1", "NSM1")) {
+            for ((type, label) in expected) {
+                val result = assertNotNull(ZapAttestationMemo.parse("$prefix:$type:$VALID_HASH"))
+                assertEquals(type, result.eventType)
+                assertEquals(label, result.eventLabel)
+            }
+        }
     }
 
     @Test
-    fun `accepts event types not yet known to this build`() {
-        val result = ZapAttestationMemo.parse("ZAP1:SOME_FUTURE_EVENT:$VALID_HASH")
+    fun `unknown byte values remain visibly unknown`() {
+        for (type in listOf("00", "10", "3f", "43", "ff")) {
+            val result = assertNotNull(ZapAttestationMemo.parse("ZAP1:$type:$VALID_HASH"))
 
-        assertEquals("SOME_FUTURE_EVENT", result?.eventType)
-        assertEquals("Some future event", result?.eventLabel)
+            assertEquals(type, result.eventType)
+            assertEquals("Unknown event (0x$type)", result.eventLabel)
+        }
     }
 
     @Test
-    fun `rejects plain text`() {
-        assertNull(ZapAttestationMemo.parse("Thanks for lunch"))
-        assertNull(ZapAttestationMemo.parse(""))
+    fun `rejects event names and malformed type bytes`() {
+        for (type in listOf("AGENT_ACTION", "MERKLE_ROOT", "9", "009", "0A", "GG", "0x09", " 09", "09 ", "")) {
+            assertNull(ZapAttestationMemo.parse("ZAP1:$type:$VALID_HASH"), type)
+        }
     }
 
     @Test
-    fun `rejects text that merely mentions the prefix`() {
-        assertNull(ZapAttestationMemo.parse("Have a look at ZAP1:AGENT_ACTION:$VALID_HASH"))
+    fun `requires exactly 64 lowercase hexadecimal hash characters`() {
+        for (length in listOf(0, 8, 32, 63, 65, 128)) {
+            assertNull(ZapAttestationMemo.parse("ZAP1:09:${"a".repeat(length)}"), "hash length $length")
+        }
+        assertNull(ZapAttestationMemo.parse("ZAP1:09:${VALID_HASH.uppercase()}"))
+        assertNull(ZapAttestationMemo.parse("ZAP1:09:${"g".repeat(64)}"))
+        assertNull(ZapAttestationMemo.parse("ZAP1:09:${VALID_HASH.dropLast(1)}\u0000"))
     }
 
     @Test
-    fun `rejects a missing or extra field`() {
-        assertNull(ZapAttestationMemo.parse("ZAP1:AGENT_ACTION"))
-        assertNull(ZapAttestationMemo.parse("ZAP1:AGENT_ACTION:$VALID_HASH:extra"))
+    fun `rejects plain text and embedded markers`() {
+        for (memo in listOf("Thanks for lunch", "", "See ZAP1:09:$VALID_HASH", "ZAP1:09:$VALID_HASH trailing text")) {
+            assertNull(ZapAttestationMemo.parse(memo))
+        }
+    }
+
+    @Test
+    fun `rejects missing and extra fields`() {
+        assertNull(ZapAttestationMemo.parse("ZAP1:09"))
+        assertNull(ZapAttestationMemo.parse("ZAP1:09:$VALID_HASH:extra"))
         assertNull(ZapAttestationMemo.parse("ZAP1::$VALID_HASH"))
+        assertNull(ZapAttestationMemo.parse("ZAP1:09::$VALID_HASH"))
     }
 
     @Test
-    fun `rejects a malformed event type`() {
-        assertNull(ZapAttestationMemo.parse("ZAP1:agent_action:$VALID_HASH"))
-        assertNull(ZapAttestationMemo.parse("ZAP1:1AGENT:$VALID_HASH"))
-        assertNull(ZapAttestationMemo.parse("ZAP1:AGENT-ACTION:$VALID_HASH"))
-    }
-
-    @Test
-    fun `rejects a malformed leaf hash`() {
-        assertNull(ZapAttestationMemo.parse("ZAP1:AGENT_ACTION:nothexadecimal"))
-        assertNull(ZapAttestationMemo.parse("ZAP1:AGENT_ACTION:abc"))
-        assertNull(ZapAttestationMemo.parse("ZAP1:AGENT_ACTION:"))
-    }
-
-    @Test
-    fun `rejects an unknown protocol prefix`() {
-        assertNull(ZapAttestationMemo.parse("ZAP2:AGENT_ACTION:$VALID_HASH"))
+    fun `rejects other or wrongly cased prefixes`() {
+        for (prefix in listOf("ZAP2", "NSM2", "zap1", "nsm1", "")) {
+            assertNull(ZapAttestationMemo.parse("$prefix:09:$VALID_HASH"))
+        }
     }
 
     private companion object {
-        const val VALID_HASH = "4f3a1c9d8b2e5a7c04f3a1c9d8b2e5a7c04f3a1c9d8b2e5a7c04f3a1c9d8b2e5"
+        const val VALID_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     }
 }

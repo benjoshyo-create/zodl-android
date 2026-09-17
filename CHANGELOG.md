@@ -9,6 +9,8 @@ and this application adheres to [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added:
 
+- ZAP1 and legacy NSM1 transaction memos display event labels and commitment hashes. These cards
+  classify memo text without verifying the attestation (#2172).
 - Bitcoin, Litecoin, EIP-681 and Solana payment URIs are parsed through the SDK and routed into asset selection,
   Pay and Swap; unsupported schemes, Solana transaction requests and unknown assets are rejected (MOB-1751).
 
