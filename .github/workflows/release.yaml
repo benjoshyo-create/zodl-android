@@ -277,6 +277,7 @@ jobs:
           exit 1
 
       - name: Purge Cloudflare cache for foss.zodl.com
+        continue-on-error: true
         run: |
           CF_API_TOKEN=$(aws secretsmanager get-secret-value \
             --secret-id /infra/cloudflare/api_token \
@@ -288,24 +289,26 @@ jobs:
             --query SecretString --output text)
           echo "::add-mask::${ZONE_ID}"
 
-          PURGE_BODY='{"files":["https://foss.zodl.com/fdroid/repo/app-zcashmainnet-foss-release-full-externallibs.apk","https://foss.zodl.com/fdroid/repo/app-zcashmainnet-foss-release.apk","https://foss.zodl.com/fdroid/repo/index-v2.json","https://foss.zodl.com/fdroid/repo/entry.jar"]}'
-
+          PURGE_SUCCESS="false"
           for attempt in 1 2 3; do
-            PURGE_RESULT=$(curl -s -X POST \
+            PURGE_RESULT=$(curl -sf -m 30 -X POST \
               "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/purge_cache" \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: application/json" \
-              --data "${PURGE_BODY}")
-            PURGE_SUCCESS=$(echo "${PURGE_RESULT}" | jq -r '.success')
-            echo "CF purge attempt ${attempt}: ${PURGE_SUCCESS}"
-            if [ "${PURGE_SUCCESS}" = "true" ]; then
-              break
-            fi
-            echo "Response: ${PURGE_RESULT}"
+              --data '{
+                "files": [
+                  "https://foss.zodl.com/fdroid/repo/app-zcashmainnet-foss-release-full-externallibs.apk",
+                  "https://foss.zodl.com/fdroid/repo/app-zcashmainnet-foss-release.apk",
+                  "https://foss.zodl.com/fdroid/repo/index-v2.json",
+                  "https://foss.zodl.com/fdroid/repo/entry.jar"
+                ]
+              }' 2>/dev/null || echo '{"success":false,"error":"curl_failed"}')
+            PURGE_SUCCESS=$(echo "${PURGE_RESULT}" | jq -r '.success // false' 2>/dev/null || echo "false")
+            echo "CF purge attempt ${attempt}: ${PURGE_SUCCESS} — ${PURGE_RESULT}"
+            [ "${PURGE_SUCCESS}" = "true" ] && break
             [ "${attempt}" -lt 3 ] && sleep 10
           done
 
           if [ "${PURGE_SUCCESS}" != "true" ]; then
-            echo "::error::Cloudflare cache purge failed after 3 attempts"
-            exit 1
+            echo "::warning::Cloudflare cache purge failed after 3 attempts (non-blocking)"
           fi
