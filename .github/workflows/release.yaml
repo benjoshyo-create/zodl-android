@@ -291,7 +291,9 @@ jobs:
 
           PURGE_SUCCESS="false"
           for attempt in 1 2 3; do
-            PURGE_RESULT=$(curl -sf -m 30 -X POST \
+            # No -f: keep response body even on 4xx/5xx so errors are diagnosable.
+            # || fallback only fires on network-level failures (DNS, timeout, etc).
+            PURGE_RESULT=$(curl -s -m 30 -X POST \
               "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/purge_cache" \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: application/json" \
@@ -302,13 +304,19 @@ jobs:
                   "https://foss.zodl.com/fdroid/repo/index-v2.json",
                   "https://foss.zodl.com/fdroid/repo/entry.jar"
                 ]
-              }' 2>/dev/null || echo '{"success":false,"error":"curl_failed"}')
+              }' || echo '{"success":false,"error":"network_failure"}')
             PURGE_SUCCESS=$(echo "${PURGE_RESULT}" | jq -r '.success // false' 2>/dev/null || echo "false")
-            echo "CF purge attempt ${attempt}: ${PURGE_SUCCESS} — ${PURGE_RESULT}"
+            echo "CF purge attempt ${attempt}: success=${PURGE_SUCCESS} response=${PURGE_RESULT}"
             [ "${PURGE_SUCCESS}" = "true" ] && break
+            # Do not retry permanent 4xx failures (auth/permission — will never succeed).
+            HTTP_CODE=$(echo "${PURGE_RESULT}" | jq -r '.errors[0].code // 0' 2>/dev/null || echo "0")
+            if [ "${HTTP_CODE}" != "0" ] && [ "${HTTP_CODE}" -lt 500 ] 2>/dev/null; then
+              echo "::warning::CF purge permanent error (code ${HTTP_CODE}) — skipping retries"
+              break
+            fi
             [ "${attempt}" -lt 3 ] && sleep 10
           done
 
           if [ "${PURGE_SUCCESS}" != "true" ]; then
-            echo "::warning::Cloudflare cache purge failed after 3 attempts (non-blocking)"
+            echo "::warning::Cloudflare cache purge failed after retries (non-blocking)"
           fi
