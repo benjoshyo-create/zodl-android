@@ -7,12 +7,53 @@ and this application adheres to [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [3.14.0 (2738)] - 2026-09-16
+
 ### Added:
 
+ - feature/zap1-attestation-memo-cards
 - ZAP1 and legacy NSM1 transaction memos display event labels and commitment hashes. These cards
   classify memo text without verifying the attestation (#2172).
 - Bitcoin, Litecoin, EIP-681 and Solana payment URIs are parsed through the SDK and routed into asset selection,
   Pay and Swap; unsupported schemes, Solana transaction requests and unknown assets are rejected (MOB-1751).
+
+- We added support for coinholder polls with up to 50 questions.
+
+### Changed:
+
+- We made submitting your votes in coinholder polls faster.
+- Coinholder Polling accepts rounds with up to 50 questions and proposal ids up to 50, matching the
+  vote chain's circuit update for the 37-question Retroactive Grants round (zcash_voting 4.0.0-rc.2).
+- Coinholder Polling now votes with at most two note bundles instead of one per five notes, so a
+  wallet with many small notes no longer pays for dozens of proofs and confirmation waits. Bundles
+  are only dropped while the voting weight they carry stays under 1 % of your eligible balance
+  (never more than 1,000 ZEC), and the confirmation screen shows exactly how much weight was left
+  out.
+- Coinholder Polling now broadcasts every bundle of a question before it starts waiting for any of
+  them to be mined, instead of waiting out one bundle at a time.
+- Coinholder Polling now sends the encrypted vote shares to the helper servers in the background
+  while it moves on to the next question, instead of waiting for each delivery before continuing.
+  A delivery that no server accepts still fails the submission, only once every vote is on chain.
+- Coinholder Polling now keeps at most two of those background share deliveries running at once, so
+  their Tor traffic no longer competes with the votes still being submitted.
+- Coinholder Polling now runs one chain per note bundle instead of taking them strictly one after
+  another, so while one bundle waits for its transaction to be mined the other is already proving
+  its next vote. Up to two proofs now run at once, each bundle on its own connection.
+- Coinholder Polling now produces the delegation proof in the background while you are still
+  answering the questions, so submission no longer starts by making you wait for it. The proof is
+  discarded and redone if anything about the round changes, and leaving the poll cancels it.
+- Coinholder Polling now asks the other vote servers about a pending transaction on every eighth
+  confirmation poll, so a vote no longer waits out its whole confirmation budget when the server
+  that accepted it stops indexing.
+- The sub-$300 refund warning and the Swap explainer now name a wrong asset, rather than a wrong address, as
+  the mistake NEAR does not refund, matching the updated design (MOB-1890).
+
+### Fixed:
+
+- Retrying a Coinholder Polling submission that failed while sending the encrypted vote shares now
+  resends the shares that never reached a helper server, instead of skipping every question whose
+  vote was already on chain and failing the same way again.
+- main
 
 ## [3.13.0 (2705)] - 2026-09-15
 
