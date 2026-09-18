@@ -33,11 +33,11 @@ import co.electriccoin.zcash.ui.design.util.stringRes
 
 /**
  * Renders a ZAP1 attestation memo as a typed event card rather than as the raw
- * `ZAP1:{EVENT_TYPE}:{LEAF_HASH}` marker, which is meaningless to a reader as plain text.
+ * `ZAP1:{type_hex}:{payload_hash}` marker.
  *
  * The card shows only what the memo already contains. No network call is made and no attempt is
- * made to resolve or verify the commitment, so nothing is disclosed that the sender did not
- * already put on chain.
+ * made to resolve or verify the commitment. The card uses only the memo already decrypted
+ * by the wallet; rendering it does not disclose that memo to an external service.
  */
 @Composable
 fun TransactionDetailZapMemo(
@@ -85,7 +85,7 @@ fun TransactionDetailZapMemo(
             Spacer(2.dp)
             SelectionContainer {
                 Text(
-                    text = state.leafHash.getValue(),
+                    text = state.payloadHash.getValue(),
                     style = ZashiTypography.textSm,
                     color = ZashiColors.Text.textPrimary,
                     fontWeight = FontWeight.Medium
@@ -98,26 +98,28 @@ fun TransactionDetailZapMemo(
 data class TransactionDetailZapMemoState(
     val eventLabel: StringResource,
     val protocolLabel: StringResource,
-    val leafHash: StringResource,
+    val payloadHash: StringResource,
     val onClick: () -> Unit,
 )
 
 /**
- * Builds the card state from a parsed attestation, abbreviating the leaf hash so the full digest
- * does not dominate the card. The untruncated value stays selectable via the memo's own copy
- * action.
+ * Abbreviates the payload hash for display. The supplied copy action retains the original memo
+ * in full, including its prefix and type, rather than copying the abbreviated display value.
  */
 fun ZapAttestationMemo.toTransactionDetailZapMemoState(onClick: () -> Unit) =
     TransactionDetailZapMemoState(
         eventLabel = stringRes(eventLabel),
         protocolLabel =
             when (protocol) {
-                ZapAttestationMemo.Protocol.ZAP1 ->
+                ZapAttestationMemo.Protocol.ZAP1 -> {
                     stringRes(R.string.transactionDetail_zapAttestation)
-                ZapAttestationMemo.Protocol.NSM1 ->
+                }
+
+                ZapAttestationMemo.Protocol.NSM1 -> {
                     stringRes(R.string.transactionDetail_zapAttestationLegacy)
+                }
             },
-        leafHash = stringRes(leafHash.abbreviateMiddle()),
+        payloadHash = stringRes(payloadHash.abbreviateMiddle()),
         onClick = onClick
     )
 
@@ -141,8 +143,8 @@ private fun Preview() =
                 state =
                     TransactionDetailZapMemoState(
                         eventLabel = stringRes("Agent action"),
-                        protocolLabel = stringRes("ZAP1 attestation"),
-                        leafHash = stringRes("4f3a1c9d8b…c04f3a1c9d"),
+                        protocolLabel = stringRes(R.string.transactionDetail_zapAttestation),
+                        payloadHash = stringRes("4f3a1c9d8b…c04f3a1c9d"),
                         onClick = {}
                     )
             )
@@ -159,8 +161,8 @@ private fun LegacyPreview() =
                 state =
                     TransactionDetailZapMemoState(
                         eventLabel = stringRes("Governance proposal"),
-                        protocolLabel = stringRes("NSM1 attestation (legacy format)"),
-                        leafHash = stringRes("8b2e5a7c04…9d8b2e5a7c"),
+                        protocolLabel = stringRes(R.string.transactionDetail_zapAttestationLegacy),
+                        payloadHash = stringRes("8b2e5a7c04…9d8b2e5a7c"),
                         onClick = {}
                     )
             )
