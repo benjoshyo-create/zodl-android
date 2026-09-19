@@ -53,7 +53,6 @@ and this application adheres to [Semantic Versioning](https://semver.org/spec/v2
 - Retrying a Coinholder Polling submission that failed while sending the encrypted vote shares now
   resends the shares that never reached a helper server, instead of skipping every question whose
   vote was already on chain and failing the same way again.
-- main
 
 ## [3.13.0 (2705)] - 2026-09-15
 
